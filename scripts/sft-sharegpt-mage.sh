@@ -45,7 +45,7 @@ MASTER_PORT="$(
 
 exec 1> >(tee "${OUTPUT_DIR}/stdout.log" >&1) 2> >(tee "${OUTPUT_DIR}/stderr.log" >&2)
 
-gpu_vis=0,1
+gpu_vis=7,6,5,4
 
 deepspeed --include localhost:$gpu_vis --master_port $MASTER_PORT \
 	--module oa_dag.algorithms.oa \
@@ -58,7 +58,7 @@ deepspeed --include localhost:$gpu_vis --master_port $MASTER_PORT \
 	--mask_ratio_min 0.0 \
 	--per_device_train_batch_size 16 \
 	--per_device_eval_batch_size 4 \
-	--gradient_accumulation_steps 4 \
+	--gradient_accumulation_steps 2 \
 	--gradient_checkpointing \
 	--learning_rate 2e-5 \
 	--lr_scheduler_type cosine \

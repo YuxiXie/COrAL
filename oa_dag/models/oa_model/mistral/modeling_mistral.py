@@ -78,13 +78,17 @@ class MistralAttentionOA(MistralAttention):
                     "with a layer index."
                 )
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+        # prepare cos & sin for positional encoding
         cos, sin = self.rotary_emb(value_states, seq_len=(torch.cat((position_ids, position_ids_to_predict), dim=-1) if position_ids_to_predict is not None else position_ids).max().item() + 1)
-        raw_query_states = query_states.clone().detach().requires_grad_(query_states.requires_grad)
+        # clone the original query_states for position embedding
+        raw_query_states = query_states.clone()
         
         if position_ids_to_predict is not None:
+            # position embedding for last layer
             key_states = apply_rotary_pos_emb_single(key_states, cos, sin, position_ids)
             query_states = apply_rotary_pos_emb_single(query_states, cos, sin, torch.cat((position_ids[:, 1:].contiguous(), position_ids[:, :1].contiguous()), dim=-1))
         else:
+            # original position embedding
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)        
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
@@ -189,13 +193,17 @@ class MistralSdpaAttentionOA(MistralAttentionOA):
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+        # prepare cos & sin for positional encoding
         cos, sin = self.rotary_emb(value_states, seq_len=(torch.cat((position_ids, position_ids_to_predict), dim=-1) if position_ids_to_predict is not None else position_ids).max().item() + 1)
-        raw_query_states = query_states.clone().detach().requires_grad_(query_states.requires_grad)
+        # clone the original query_states for position embedding
+        raw_query_states = query_states.clone()
 
         if position_ids_to_predict is not None:
+            # position embedding for last layer
             key_states = apply_rotary_pos_emb_single(key_states, cos, sin, position_ids)
             query_states = apply_rotary_pos_emb_single(query_states, cos, sin, torch.cat((position_ids[:, 1:].contiguous(), position_ids[:, :1].contiguous()), dim=-1))
         else:
+            # original position embedding
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
@@ -303,6 +311,7 @@ class MistralDecoderLayerOA(nn.Module):
             use_cache=use_cache,
         )
         if positions_to_replace is not None:
+            # pad with the corresponding hidden states for residual calculation
             extended_len = hidden_states.size(1) - residual.size(1)
             add_residual = torch.stack([residual[b_id, positions_to_replace[b_id][0] - 1] for b_id in range(positions_to_replace.size(0))]).unsqueeze(1).expand(residual.size(0), extended_len, residual.size(-1))
             residual = torch.cat((residual, add_residual), dim=1)
