@@ -72,6 +72,7 @@ def parse_arguments() -> argparse.Namespace:
 
     # Training
     training_parser = parser.add_argument_group('training')
+    # - for denoising
     training_parser.add_argument(
         '--reconstruct',
         default=False,
@@ -102,6 +103,7 @@ def parse_arguments() -> argparse.Namespace:
         type=float,
         default=0.1,
     )
+    # - for partial fine-tuning
     training_parser.add_argument(
         '--tune_final_layer_only',
         default=False,
@@ -112,6 +114,7 @@ def parse_arguments() -> argparse.Namespace:
         default=False,
         action='store_true',
     )
+    # - for mask & reconstruction
     training_parser.add_argument(
         '--mask_ratio_min',
         type=float,
@@ -128,14 +131,14 @@ def parse_arguments() -> argparse.Namespace:
         action='store_true',
     )
     training_parser.add_argument(
-        '--max_mask_ratio_mu',
-        type=float,
-        default=0.95,
-    )
-    training_parser.add_argument(
         '--min_mask_ratio_mu',
         type=float,
         default=0.05,
+    )
+    training_parser.add_argument(
+        '--max_mask_ratio_mu',
+        type=float,
+        default=0.95,
     )
     training_parser.add_argument(
         '--mask_ratio_mu',
@@ -147,6 +150,7 @@ def parse_arguments() -> argparse.Namespace:
         type=float,
         default=0.25,
     )
+    # - for left-to-right consecutive mask & reconstruction
     training_parser.add_argument(
         '--mage_consecutive',
         default=False,
@@ -157,6 +161,7 @@ def parse_arguments() -> argparse.Namespace:
         default=False,
         action='store_true',
     )
+    # - for shuffle input order
     training_parser.add_argument(
         '--init_shuffle_ratio_mage',
         type=float,

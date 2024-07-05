@@ -436,6 +436,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                     # sample to get masking threshold
                     if self.args.dynamic_mask_ratio_mu:
                         self.args.mask_ratio_mu = self.args.min_mask_ratio_mu + (self.args.max_mask_ratio_mu - self.args.min_mask_ratio_mu) * (self.global_step / len(self.train_dataloader) / self.args.epochs)
+                        # self.args.mask_ratio_mu = self.args.min_mask_ratio_mu + (self.args.max_mask_ratio_mu - self.args.min_mask_ratio_mu) * ((self.global_step // len(self.train_dataloader)) / (self.args.epochs - 1))
                         self.mask_ratio_generator = get_variable_generator(self.args.mask_ratio_mu, self.args.mask_ratio_std, self.args.mask_ratio_min, self.args.mask_ratio_max)
                     mask_threshold = self.mask_ratio_generator.rvs(1)[0]
                     if self.args.mage_consecutive:  # mask the right part
@@ -494,11 +495,12 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                             random_noise = torch.rand(replace_ids.size(-1), device=self.args.device)
                             new_replace_ids = replace_ids[random_noise.lt(self.args.replace_with_prob).nonzero().squeeze(-1)]
                         # #################### sanity check ####################
-                        # text = self.tokenizer.decode([cur_input_ids[cur_position_ids.eq(idx).nonzero()[0].item()].item() if idx in cur_position_ids else 583 for idx in range(cur_position_ids.min().item(), cur_position_ids.max().item() + 1)])
-                        # cur_input_ids[new_replace_ids] = torch.randint(self.tokenizer.vocab_size, cur_input_ids[new_replace_ids].size(), device=self.args.device)
-                        # text1 = self.tokenizer.decode([cur_input_ids[cur_position_ids.eq(idx).nonzero()[0].item()].item() if idx in cur_position_ids else 583 for idx in range(cur_position_ids.min().item(), cur_position_ids.max().item() + 1)])
-                        # cur_input_ids[replace_ids] = torch.randint(self.tokenizer.vocab_size, cur_input_ids[replace_ids].size(), device=self.args.device)
-                        # text2 = self.tokenizer.decode([cur_input_ids[cur_position_ids.eq(idx).nonzero()[0].item()].item() if idx in cur_position_ids else 583 for idx in range(cur_position_ids.min().item(), cur_position_ids.max().item() + 1)])
+                        # _cur_input_ids = cur_input_ids.clone()
+                        # text = self.tokenizer.decode([_cur_input_ids[cur_position_ids.eq(idx).nonzero()[0].item()].item() if idx in cur_position_ids else 583 for idx in range(cur_position_ids.min().item(), cur_position_ids.max().item() + 1)])
+                        # _cur_input_ids[new_replace_ids] = torch.randint(self.tokenizer.vocab_size, _cur_input_ids[new_replace_ids].size(), device=self.args.device)
+                        # text1 = self.tokenizer.decode([_cur_input_ids[cur_position_ids.eq(idx).nonzero()[0].item()].item() if idx in cur_position_ids else 583 for idx in range(cur_position_ids.min().item(), cur_position_ids.max().item() + 1)])
+                        # _cur_input_ids[replace_ids] = torch.randint(self.tokenizer.vocab_size, _cur_input_ids[replace_ids].size(), device=self.args.device)
+                        # text2 = self.tokenizer.decode([_cur_input_ids[cur_position_ids.eq(idx).nonzero()[0].item()].item() if idx in cur_position_ids else 583 for idx in range(cur_position_ids.min().item(), cur_position_ids.max().item() + 1)])
                         # import ipdb; ipdb.set_trace()
                         # ######################################################
                         # replace input ids
