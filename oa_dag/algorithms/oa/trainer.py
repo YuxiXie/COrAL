@@ -417,7 +417,8 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         if self.args.vanilla_shuffle:
             return self.vanilla_shuffle_train_step(input_ids, labels, attention_mask, raw_position_ids)
         
-        mask_threshold_list, mask_ratio_list, replace_threshold_list, replace_ratio_list = [], [], [], []
+        mask_threshold_list, mask_ratio_list = [], []   # ratio and proportion to mask the inputs to predict simutaneously
+        replace_threshold_list, replace_ratio_list = [], []
         all_input_ids, all_labels, all_attention_mask, all_position_ids = [], [], [], []
         all_positions_to_replace, all_position_ids_to_prediction = [], []
         max_add_positions, max_seq_len = 0, 0
@@ -425,40 +426,39 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             input_ids_list, labels_list, attention_mask_list, position_ids_list = [], [], [], []
             positions_to_replace_list, position_ids_to_predict_list, add_labels_list = [], [], []
             for i in range(batch_size):
-                # extract label positions
+                ##=== extract label positions ===##
                 is_label = labels[i].ne(IGNORE_INDEX)
                 label_position_ids = is_label.nonzero().squeeze(-1)
                 
-                # shuffle and mask
+                ##=== shuffle and mask ===##
                 keep_sample = True
                 while keep_sample:
+                    # sample to get masking threshold
                     if self.args.dynamic_mask_ratio_mu:
                         self.args.mask_ratio_mu = self.args.min_mask_ratio_mu + (self.args.max_mask_ratio_mu - self.args.min_mask_ratio_mu) * (self.global_step / len(self.train_dataloader) / self.args.epochs)
                         self.mask_ratio_generator = get_variable_generator(self.args.mask_ratio_mu, self.args.mask_ratio_std, self.args.mask_ratio_min, self.args.mask_ratio_max)
                     mask_threshold = self.mask_ratio_generator.rvs(1)[0]
-                    if self.args.mage_consecutive:
+                    if self.args.mage_consecutive:  # mask the right part
                         random_noise = torch.arange(0, label_position_ids.size(-1), dtype=torch.float, device=self.args.device)
-                        random_noise = (-random_noise + label_position_ids.size(-1) - 0.5) / label_position_ids.size(-1)
-                    else:
+                        random_noise = (-random_noise + label_position_ids.size(-1) - 0.5) / label_position_ids.size(-1)    # reverse to be descending
+                    else:   # randomly mask
                         random_noise = torch.rand(label_position_ids.size(-1), device=self.args.device)
+                    # extract the position ids of the tokens to mask
                     mask_label_position_ids = label_position_ids[random_noise.lt(mask_threshold).nonzero().squeeze(-1)]
                     if mask_label_position_ids.size(0) > 0 or label_position_ids.size(0) <= 0:
                         keep_sample = False
                 mask_threshold_list.append(torch.tensor(mask_threshold, device=self.args.device))
                 mask_ratio_list.append(torch.tensor(mask_label_position_ids.size(0) / max(1, label_position_ids.size(-1)), device=self.args.device))
+                ##=== mask dedicated tokens ===##
                 mask_attention_mask = attention_mask[i].clone()
                 mask_attention_mask[mask_label_position_ids] = False
                 mask_attention_mask[-1] = False     # mask the final token
                 end_index = mask_attention_mask.nonzero().max()
-                mask_attention_mask[end_index + 1] = True
+                mask_attention_mask[end_index + 1] = True   # for training only -- the token to predict next
                 
-                # select the initial token to predict
+                ##=== initialize input ids with position info ===##
+                # select the initial token (at end_idx+1) to predict
                 select_index = torch.randint(mask_attention_mask.nonzero().size(0), (1,)).to(self.args.device)
-                cur_labels = labels[i].clone()
-                cur_labels[select_index.item()] = input_ids[i][select_index.item()]
-                cur_labels = cur_labels[mask_attention_mask.nonzero().squeeze()]
-                max_seq_len = max(cur_labels.size(-1), max_seq_len)
-                
                 # init input_ids
                 cur_input_ids = input_ids[i].clone()
                 cur_input_ids[mask_label_position_ids] = self.tokenizer.pad_token_id
@@ -469,34 +469,39 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 cur_position_ids[end_index + 1] = raw_position_ids[select_index.item()]
                 cur_position_ids = cur_position_ids[mask_attention_mask.nonzero().squeeze()]
                 
+                ##=== rearrange unmasked tokens to get labels ===##
+                cur_labels = labels[i][cur_position_ids]
+                max_seq_len = max(cur_labels.size(-1), max_seq_len)
                 # extract position ids to predict
                 position_ids_to_predict = raw_position_ids[mask_label_position_ids]
                 add_cur_labels = labels[i][position_ids_to_predict]
-                # # replace input ids
+                
+                ##=== replace input ids ===##
                 if self.args.reconstruct:
+                    # sample the threshold for reconstruction
                     replace_threshold = self.replace_ratio_generator.rvs(1)[0]
                     random_noise = torch.rand(cur_input_ids.size(-1), device=self.args.device)
-                    replace_ids = torch.logical_and(random_noise.lt(replace_threshold), labels[i, cur_position_ids].ne(IGNORE_INDEX)).nonzero().squeeze(-1)
+                    replace_ids = torch.logical_and(random_noise.lt(replace_threshold), cur_labels.ne(IGNORE_INDEX)).nonzero().squeeze(-1)
                     replace_threshold_list.append(torch.tensor(replace_threshold, device=self.args.device))
                     replace_ratio_list.append(torch.tensor(replace_ids.size(0) / max(1, labels[i, cur_position_ids].ne(IGNORE_INDEX).sum()), device=self.args.device))
                     if replace_ids.size(0) > 0:
+                        # update the positions to predict
+                        position_ids_to_predict = torch.cat((position_ids_to_predict, cur_position_ids[replace_ids]), dim=-1)
+                        add_cur_labels = torch.cat((add_cur_labels, cur_labels[replace_ids]), dim=-1)
                         # replace input ids to reconstruct
                         if self.args.replace_with_prob < 1:
                             # replace with probability < 1, so otherwise it should remain the same
                             random_noise = torch.rand(replace_ids.size(-1), device=self.args.device)
                             new_replace_ids = replace_ids[random_noise.lt(self.args.replace_with_prob).nonzero().squeeze(-1)]
-                        # update the positions to predict
-                        position_ids_to_predict = torch.cat((position_ids_to_predict, cur_position_ids[replace_ids]), dim=-1)
-                        add_cur_labels = torch.cat((add_cur_labels, cur_input_ids[replace_ids]), dim=-1)
-                        # replace input ids
                         # #################### sanity check ####################
-                        text = self.tokenizer.decode([cur_input_ids[cur_position_ids.eq(idx).nonzero()[0].item()].item() if idx in cur_position_ids else 583 for idx in range(cur_position_ids.min().item(), cur_position_ids.max().item() + 1)])
-                        cur_input_ids[new_replace_ids] = torch.randint(self.tokenizer.vocab_size, cur_input_ids[new_replace_ids].size(), device=self.args.device)
-                        text1 = self.tokenizer.decode([cur_input_ids[cur_position_ids.eq(idx).nonzero()[0].item()].item() if idx in cur_position_ids else 583 for idx in range(cur_position_ids.min().item(), cur_position_ids.max().item() + 1)])
-                        cur_input_ids[replace_ids] = torch.randint(self.tokenizer.vocab_size, cur_input_ids[replace_ids].size(), device=self.args.device)
-                        text2 = self.tokenizer.decode([cur_input_ids[cur_position_ids.eq(idx).nonzero()[0].item()].item() if idx in cur_position_ids else 583 for idx in range(cur_position_ids.min().item(), cur_position_ids.max().item() + 1)])
-                        import ipdb; ipdb.set_trace()
+                        # text = self.tokenizer.decode([cur_input_ids[cur_position_ids.eq(idx).nonzero()[0].item()].item() if idx in cur_position_ids else 583 for idx in range(cur_position_ids.min().item(), cur_position_ids.max().item() + 1)])
+                        # cur_input_ids[new_replace_ids] = torch.randint(self.tokenizer.vocab_size, cur_input_ids[new_replace_ids].size(), device=self.args.device)
+                        # text1 = self.tokenizer.decode([cur_input_ids[cur_position_ids.eq(idx).nonzero()[0].item()].item() if idx in cur_position_ids else 583 for idx in range(cur_position_ids.min().item(), cur_position_ids.max().item() + 1)])
+                        # cur_input_ids[replace_ids] = torch.randint(self.tokenizer.vocab_size, cur_input_ids[replace_ids].size(), device=self.args.device)
+                        # text2 = self.tokenizer.decode([cur_input_ids[cur_position_ids.eq(idx).nonzero()[0].item()].item() if idx in cur_position_ids else 583 for idx in range(cur_position_ids.min().item(), cur_position_ids.max().item() + 1)])
+                        # import ipdb; ipdb.set_trace()
                         # ######################################################
+                        # replace input ids
                         if self.args.replace_with_prob < 1 and new_replace_ids.size(0) > 0:
                             cur_input_ids[new_replace_ids] = torch.randint(self.tokenizer.vocab_size, cur_input_ids[new_replace_ids].size(), device=self.args.device)
                         else:
@@ -505,22 +510,23 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 
                 input_ids_list.append(cur_input_ids)
                 labels_list.append(cur_labels)
-                attention_mask_list.append(mask_attention_mask)
+                attention_mask_list.append(torch.ones_like(cur_input_ids, dtype=torch.bool))
                 position_ids_list.append(cur_position_ids)
                 positions_to_replace_list.append(torch.tensor(cur_input_ids.size(-1) - 1, device=self.args.device))
                 position_ids_to_predict_list.append(position_ids_to_predict)
                 add_labels_list.append(add_cur_labels)
             
+            ##=== arrange samples with padding ===##
             for i in range(batch_size):
                 # pad all input samples to be of the same length
                 pad_len = max_seq_len - input_ids_list[i].size(-1)
                 attention_mask_list[i] = torch.cat((
-                    torch.ones((input_ids_list[i].size(-1),), dtype=torch.bool, device=self.args.device),
+                    torch.ones_like(input_ids_list[i], dtype=torch.bool),
                     torch.zeros((pad_len,), dtype=torch.bool, device=self.args.device),
                 ), dim=-1).bool()
                 # shuffle input orders
                 if self.args.mage_shuffle:
-                    shuffle_ratio = self.args.init_shuffle_ratio_mage + (self.args.max_shuffle_ratio_mage - self.args.init_shuffle_ratio_mage) * self.global_step / len(self.train_dataloader) / self.args.epochs
+                    shuffle_ratio = self.args.init_shuffle_ratio_mage + (self.args.max_shuffle_ratio_mage - self.args.init_shuffle_ratio_mage) * (self.global_step / len(self.train_dataloader) / self.args.epochs)
                     if torch.rand(1) < shuffle_ratio:
                         # shuffle the order of inputs
                         random_noise = torch.rand(input_ids_list[i].size(-1), device=self.args.device)
@@ -576,7 +582,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             replace_ratio = get_all_reduce_mean(replace_ratio)
         
         dist.barrier()
-
+        
         return {
             'train/loss': loss.item(),
             'train/lr': self.model.optimizer.param_groups[0]['lr'],

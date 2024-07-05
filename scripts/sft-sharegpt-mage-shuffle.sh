@@ -15,7 +15,7 @@ export LOGLEVEL="${LOGLEVEL:-WARNING}"
 # MODEL_NAME_OR_PATH="huggyllama/llama-7b"
 # MODEL_NAME_OR_PATH="mistralai/Mistral-7B-v0.3"
 MODEL_NAME_OR_PATH="mistralai/Mistral-7B-Instruct-v0.2"
-OUTPUT_DIR="/share/edc/home/yuxi_xie/oa_dag/checkpoints/v0628/mage-llm-mu_anneal"
+OUTPUT_DIR="/share/edc/home/yuxi_xie/oa_dag/checkpoints/v0628/mage-llm-mu_anneal2"
 unset HOSTFILE
 ZERO_STAGE=3
 OFFLOAD="optimizer"
@@ -55,7 +55,7 @@ deepspeed --include localhost:$gpu_vis --master_port $MASTER_PORT \
 	--trust_remote_code True \
 	--epochs 3 \
 	--dynamic_mask_ratio_mu \
-	--min_mask_ratio_mu 0.05 \
+	--min_mask_ratio_mu 0.25 \
 	--mask_ratio_min 0.01 \
 	--save_interval 10240 \
 	--per_device_train_batch_size 16 \

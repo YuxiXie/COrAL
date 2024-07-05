@@ -15,7 +15,7 @@ export LOGLEVEL="${LOGLEVEL:-WARNING}"
 # MODEL_NAME_OR_PATH="huggyllama/llama-7b"
 # MODEL_NAME_OR_PATH="mistralai/Mistral-7B-v0.3"
 MODEL_NAME_OR_PATH="mistralai/Mistral-7B-Instruct-v0.2"
-OUTPUT_DIR="/share/edc/home/yuxi_xie/oa_dag/checkpoints/v0628/replace/mage-llm-replace-debug"
+OUTPUT_DIR="/share/edc/home/yuxi_xie/oa_dag/checkpoints/dev"
 unset HOSTFILE
 ZERO_STAGE=3
 OFFLOAD="optimizer"
@@ -54,9 +54,8 @@ deepspeed --include localhost:$gpu_vis --master_port $MASTER_PORT \
 	--max_length 1024 \
 	--trust_remote_code True \
 	--epochs 3 \
-	--reconstruct \
-	--replace_with_prob 0.8 \
 	--save_interval 10240 \
+	--reconstruct \
 	--per_device_train_batch_size 16 \
 	--per_device_eval_batch_size 4 \
 	--gradient_accumulation_steps 2 \
