@@ -18,7 +18,7 @@ MODEL_NAME_OR_PATH="mistralai/Mistral-7B-Instruct-v0.2"
 OUTPUT_DIR="/share/edc/home/yuxi_xie/oa_dag/checkpoints/dev"
 unset HOSTFILE
 ZERO_STAGE=3
-OFFLOAD="optimizer"
+OFFLOAD="none"
 
 mkdir -p "${OUTPUT_DIR}"
 OUTPUT_DIR="$(cd "${OUTPUT_DIR}" &>/dev/null && pwd)"
@@ -28,7 +28,7 @@ fi
 
 cp -f "$0" "${OUTPUT_DIR}/script.sh"
 
-export WANDB_MODE=online
+export WANDB_MODE=dryrun
 export WANDB_API_KEY="1396a7d2a29a8e8241dff6e0e6371f2ad61e11e2"
 if [[ -z "${WANDB_API_KEY}" ]]; then
 	export WANDB_MODE="offline"
@@ -45,7 +45,7 @@ MASTER_PORT="$(
 
 exec 1> >(tee "${OUTPUT_DIR}/stdout.log" >&1) 2> >(tee "${OUTPUT_DIR}/stderr.log" >&2)
 
-gpu_vis=0,1
+gpu_vis=$1
 
 deepspeed --include localhost:$gpu_vis --master_port $MASTER_PORT \
 	--module oa_dag.algorithms.oa \
@@ -53,15 +53,21 @@ deepspeed --include localhost:$gpu_vis --master_port $MASTER_PORT \
 	--model_name_or_path "${MODEL_NAME_OR_PATH}" \
 	--max_length 1024 \
 	--trust_remote_code True \
-	--epochs 3 \
-	--reconstruct \
-	--replace_with_prob 0.5 \
+	--epochs 40 \
 	--save_interval 10240 \
-	--per_device_train_batch_size 16 \
+	--additional_layer \
+	--tune_final_layer_only \
+	--dynamic_mask_ratio_mu \
+	--min_mask_ratio_mu 0.15 \
+	--max_mask_ratio_mu 0.95 \
+	--reconstruct \
+	--replace_ratio_mu 0.15 \
+	--replace_with_prob 0.5 \
+	--per_device_train_batch_size 4 \
 	--per_device_eval_batch_size 4 \
-	--gradient_accumulation_steps 4 \
+	--gradient_accumulation_steps $2 \
 	--gradient_checkpointing \
-	--learning_rate 2e-5 \
+	--learning_rate 1e-3 \
 	--lr_scheduler_type cosine \
 	--lr_warmup_ratio 0.03 \
 	--weight_decay 0.0 \
@@ -75,5 +81,7 @@ deepspeed --include localhost:$gpu_vis --master_port $MASTER_PORT \
 	--tf32 True
 
 # --exclude_l2r_order \
+# --tune_final_layer_only \
 
 # bash scripts/sft-sharegpt-mage.sh
+
