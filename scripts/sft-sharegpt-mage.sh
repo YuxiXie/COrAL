@@ -15,7 +15,7 @@ export LOGLEVEL="${LOGLEVEL:-WARNING}"
 # MODEL_NAME_OR_PATH="huggyllama/llama-7b"
 # MODEL_NAME_OR_PATH="mistralai/Mistral-7B-v0.3"
 MODEL_NAME_OR_PATH="mistralai/Mistral-7B-Instruct-v0.2"
-OUTPUT_DIR="/share/edc/home/yuxi_xie/oa_dag/checkpoints/v0705/oa-base-mu0.55-min0"
+OUTPUT_DIR="/share/edc/home/yuxi_xie/oa_dag/checkpoints/v0705/oa-denoise-mu0.15to0.75-dymin-rmu1.0-r0.15"
 unset HOSTFILE
 ZERO_STAGE=3
 OFFLOAD="optimizer"
@@ -45,7 +45,7 @@ MASTER_PORT="$(
 
 exec 1> >(tee "${OUTPUT_DIR}/stdout.log" >&1) 2> >(tee "${OUTPUT_DIR}/stderr.log" >&2)
 
-gpu_vis=7,6,5,4
+gpu_vis=3,2,1,0
 
 deepspeed --include localhost:$gpu_vis --master_port $MASTER_PORT \
 	--module oa_dag.algorithms.oa \
@@ -55,7 +55,12 @@ deepspeed --include localhost:$gpu_vis --master_port $MASTER_PORT \
 	--trust_remote_code True \
 	--epochs 3 \
 	--save_interval 10240 \
-	--mask_ratio_min 0.0 \
+	--dynamic_mask_ratio_mu \
+	--min_mask_ratio_mu 0.15 \
+	--max_mask_ratio_mu 0.75 \
+	--reconstruct \
+	--replace_ratio_mu 0.15 \
+	--replace_with_prob 0.5 \
 	--per_device_train_batch_size 16 \
 	--per_device_eval_batch_size 4 \
 	--gradient_accumulation_steps 2 \
@@ -77,3 +82,4 @@ deepspeed --include localhost:$gpu_vis --master_port $MASTER_PORT \
 # --tune_final_layer_only \
 
 # bash scripts/sft-sharegpt-mage.sh
+

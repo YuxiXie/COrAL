@@ -34,9 +34,8 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         self.ds_eval_config = ds_eval_config
         super().__init__(args, ds_config)
         
-        if self.args.dynamic_mask_ratio_mu:
-            self.args.mask_ratio_mu = self.args.min_mask_ratio_mu
-        self.mask_ratio_generator = get_variable_generator(self.args.mask_ratio_mu, self.args.mask_ratio_std, self.args.mask_ratio_min, self.args.mask_ratio_max)
+        if not self.args.dynamic_mask_ratio_mu:
+            self.mask_ratio_generator = get_variable_generator(self.args.mask_ratio_mu, self.args.mask_ratio_std, self.args.mask_ratio_min, self.args.mask_ratio_max)
         self.replace_ratio_generator = get_variable_generator(self.args.replace_ratio_mu, self.args.replace_ratio_std, self.args.replace_ratio_min, self.args.replace_ratio_max)
     
     def init_models(self) -> None:
@@ -309,6 +308,22 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             position_ids_to_predict=position_ids_to_predict,
             use_cache=False
         )
+        # #################### sanity check ####################
+        # logits = outputs.logits.detach()
+        # orig_len = position_ids.size(-1)
+        # shift_logits = torch.cat((logits[..., :orig_len-1, :].contiguous(), logits[..., orig_len:, :].contiguous()), dim=1)
+        # shift_labels = labels[..., 1:].contiguous()
+        # shift_logits = shift_logits.view(-1, self.model.module.config.vocab_size)
+        # shift_labels = shift_labels.view(-1).to(shift_logits.device)
+        # loss_fct = CrossEntropyLoss(reduction='none')
+        # loss = loss_fct(shift_logits, shift_labels).view(input_ids.size(0), -1)
+        # idx = 0
+        # selected_ids = labels[idx][input_ids.size(-1):].ge(0).nonzero().squeeze()
+        # losses = loss[idx][input_ids.size(-1) - 1:][selected_ids]
+        # special_ids = losses.lt(2).nonzero().squeeze()
+        # tokens = [self.tokenizer.decode([x]) for x in labels[idx][input_ids.size(-1):][selected_ids[special_ids]]]
+        # import ipdb; ipdb.set_trace()
+        # ######################################################
         return {
             'loss': outputs.loss,
         }
@@ -326,6 +341,8 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         cur_position_ids = raw_position_ids.unsqueeze(0).view(-1, seq_length).expand(batch_size, seq_length)
         cur_input_ids = input_ids
         cur_labels = labels
+        
+        shuffle_ratio = self.args.init_shuffle_ratio + (self.args.max_shuffle_ratio - self.args.init_shuffle_ratio) * self.global_step / len(self.train_dataloader) / self.args.epochs
         
         all_input_ids, all_labels, all_attention_mask, all_position_ids = [], [], [], []        
         flag = not self.args.exclude_l2r_order
@@ -357,7 +374,6 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 labels_copy = labels[i].clone()
                 position_ids_copy = raw_position_ids.clone()
                 for label_position_ids_group in output_ids_groups:
-                    shuffle_ratio = self.args.init_shuffle_ratio + (self.args.max_shuffle_ratio - self.args.init_shuffle_ratio) * self.global_step / len(self.train_dataloader) / self.args.epochs
                     if torch.rand(1) < shuffle_ratio:
                         # shuffle the order of labels
                         random_noise = torch.rand(label_position_ids_group.size(-1), device=self.args.device)
@@ -416,6 +432,15 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         
         if self.args.vanilla_shuffle:
             return self.vanilla_shuffle_train_step(input_ids, labels, attention_mask, raw_position_ids)
+
+        if self.args.dynamic_mask_ratio_mu:
+            mask_ratio_mu = self.args.min_mask_ratio_mu + (self.args.max_mask_ratio_mu - self.args.min_mask_ratio_mu) * (self.global_step / len(self.train_dataloader) / self.args.epochs)
+            # mask_ratio_min = self.args.mask_ratio_min
+            mask_ratio_mu = min(mask_ratio_mu, self.args.mask_ratio_mu)
+            mask_ratio_min = mask_ratio_mu - 0.05   # TODO: magic number
+            self.mask_ratio_generator = get_variable_generator(mask_ratio_mu, self.args.mask_ratio_std, mask_ratio_min, self.args.mask_ratio_max)
+        if self.args.mage_shuffle:
+            shuffle_ratio = self.args.init_shuffle_ratio_mage + (self.args.max_shuffle_ratio_mage - self.args.init_shuffle_ratio_mage) * (self.global_step / len(self.train_dataloader) / self.args.epochs)
         
         mask_threshold_list, mask_ratio_list = [], []   # ratio and proportion to mask the inputs to predict simutaneously
         replace_threshold_list, replace_ratio_list = [], []
@@ -433,11 +458,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 ##=== shuffle and mask ===##
                 keep_sample = True
                 while keep_sample:
-                    # sample to get masking threshold
-                    if self.args.dynamic_mask_ratio_mu:
-                        self.args.mask_ratio_mu = self.args.min_mask_ratio_mu + (self.args.max_mask_ratio_mu - self.args.min_mask_ratio_mu) * (self.global_step / len(self.train_dataloader) / self.args.epochs)
-                        # self.args.mask_ratio_mu = self.args.min_mask_ratio_mu + (self.args.max_mask_ratio_mu - self.args.min_mask_ratio_mu) * ((self.global_step // len(self.train_dataloader)) / (self.args.epochs - 1))
-                        self.mask_ratio_generator = get_variable_generator(self.args.mask_ratio_mu, self.args.mask_ratio_std, self.args.mask_ratio_min, self.args.mask_ratio_max)
+                    # sample to get masking threshold                    
                     mask_threshold = self.mask_ratio_generator.rvs(1)[0]
                     if self.args.mage_consecutive:  # mask the right part
                         random_noise = torch.arange(0, label_position_ids.size(-1), dtype=torch.float, device=self.args.device)
@@ -482,7 +503,8 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                     # sample the threshold for reconstruction
                     replace_threshold = self.replace_ratio_generator.rvs(1)[0]
                     random_noise = torch.rand(cur_input_ids.size(-1), device=self.args.device)
-                    replace_ids = torch.logical_and(random_noise.lt(replace_threshold), cur_labels.ne(IGNORE_INDEX)).nonzero().squeeze(-1)
+                    # replace_ids = torch.logical_and(random_noise.lt(replace_threshold), cur_labels.ne(IGNORE_INDEX)).nonzero().squeeze(-1) # TODO
+                    replace_ids = torch.logical_and(random_noise.le(1), cur_labels.ne(IGNORE_INDEX)).nonzero().squeeze(-1) # TODO
                     replace_threshold_list.append(torch.tensor(replace_threshold, device=self.args.device))
                     replace_ratio_list.append(torch.tensor(replace_ids.size(0) / max(1, labels[i, cur_position_ids].ne(IGNORE_INDEX).sum()), device=self.args.device))
                     if replace_ids.size(0) > 0:
@@ -491,6 +513,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                         add_cur_labels = torch.cat((add_cur_labels, cur_labels[replace_ids]), dim=-1)
                         # replace input ids to reconstruct
                         if self.args.replace_with_prob < 1:
+                            self.args.replace_with_prob = replace_threshold # TODO
                             # replace with probability < 1, so otherwise it should remain the same
                             random_noise = torch.rand(replace_ids.size(-1), device=self.args.device)
                             new_replace_ids = replace_ids[random_noise.lt(self.args.replace_with_prob).nonzero().squeeze(-1)]
@@ -528,7 +551,6 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 ), dim=-1).bool()
                 # shuffle input orders
                 if self.args.mage_shuffle:
-                    shuffle_ratio = self.args.init_shuffle_ratio_mage + (self.args.max_shuffle_ratio_mage - self.args.init_shuffle_ratio_mage) * (self.global_step / len(self.train_dataloader) / self.args.epochs)
                     if torch.rand(1) < shuffle_ratio:
                         # shuffle the order of inputs
                         random_noise = torch.rand(input_ids_list[i].size(-1), device=self.args.device)

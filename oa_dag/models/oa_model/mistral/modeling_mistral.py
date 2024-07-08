@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from transformers import MistralPreTrainedModel, PreTrainedTokenizerBase
 from transformers.models.mistral.modeling_mistral import (
-    MistralConfig, MistralModel, MistralDecoderLayer, MistralAttention, MistralRMSNorm, MistralMLP,
+    MistralConfig, MistralAttention, MistralRMSNorm, MistralMLP,
     _CONFIG_FOR_DOC, MISTRAL_INPUTS_DOCSTRING, 
     rotate_half, apply_rotary_pos_emb, repeat_kv, _prepare_4d_causal_attention_mask_for_sdpa, _prepare_4d_causal_attention_mask,
 )
@@ -255,7 +255,7 @@ class MistralSdpaAttentionOA(MistralAttentionOA):
 
 MISTRAL_ATTENTION_CLASSES = {
     "eager": MistralAttentionOA,
-    # "flash_attention_2": MistralFlashAttention2,
+    # "flash_attention_2": MistralFlashAttention2OA,
     "sdpa": MistralSdpaAttentionOA,
 }
 
@@ -813,5 +813,3 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
         # import ipdb; ipdb.set_trace()
         
         return tracks, input_ids
-        
-    
