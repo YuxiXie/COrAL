@@ -14,6 +14,7 @@ __all__ = [
     'PROMPT_ASSISTANT',
     'PROMPT_INPUT',
     'PROMPT_DICT',
+    'PROMPT_DICTS',
     'ADAM_BETAS',
 ]
 
@@ -39,6 +40,15 @@ PROMPT_DICT: dict[str, str] = {
     'prompt_user': PROMPT_USER,
     'prompt_assistant': PROMPT_ASSISTANT,
     'prompt_input': PROMPT_INPUT,
+}
+
+PROMPT_DICTS: dict[str, dict[str, str]] = {
+    'mistral-instruct': PROMPT_DICT,
+    'mistral-metamath': {
+        'prompt_begin': 'Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n',
+        'prompt_user': '### Instruction:\n{input}\n\n',
+        'prompt_assistant': '### Response:'
+    },
 }
 
 ADAM_BETAS: tuple[float, float] = (0.9, 0.95)

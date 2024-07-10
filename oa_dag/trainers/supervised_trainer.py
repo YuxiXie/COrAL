@@ -182,7 +182,20 @@ class SupervisedTrainer(TrainerBase):
     def train_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         """Perform a single training step."""
         raise NotImplementedError
+    
+    @abc.abstractmethod
+    def vanilla_shuffle_train_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Perform a single training step."""
+        raise NotImplementedError
 
+    @abc.abstractmethod
+    @torch.no_grad()
+    def masking(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise NotImplementedError
+    
+    def create_oa_batch(self, batch: TokenizedDataset) -> dict[str, Any]:
+        return self.masking(**batch)
+    
     def train(self) -> None:
         """Train the model."""
         self.logger.print('***** Running training *****')
@@ -215,14 +228,28 @@ class SupervisedTrainer(TrainerBase):
 
         for epoch in range(self.args.epochs):
             if epoch < epochs_trained: continue
-            self.model.train()
+            # self.model.train()
 
             for batch in self.train_dataloader:
                 if steps_trained_in_current_epoch > 0:
                     steps_trained_in_current_epoch -= 1
                     continue
                 
-                info = self.train_step(**to_device(batch, self.args.device))
+                ##=== generate batch (with noise) ===##
+                self.set_eval()
+                if self.args.vanilla_shuffle:
+                    oa_batch = batch
+                else:
+                    oa_batch = self.create_oa_batch(to_device(batch, self.args.device))
+                torch.cuda.empty_cache()
+                
+                ##=== training ===##
+                self.set_train()
+                # info = self.train_step(**to_device(batch, self.args.device))
+                if self.args.vanilla_shuffle:
+                    info = self.vanilla_shuffle_train_step(**oa_batch)
+                else:
+                    info = self.train_step(**oa_batch)
                 get_accelerator().empty_cache()
                 torch.cuda.empty_cache()
 

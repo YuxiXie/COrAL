@@ -44,7 +44,7 @@ class PromptOnlyBatch(TypedDict, total=True):
 
 class PromptOnlyDataset(TokenizedDataset):
     def preprocess(self, raw_sample: RawSample) -> PromptOnlySample:
-        prompt = format_prompt(input=raw_sample['input'], eos_token=self.tokenizer.eos_token)
+        prompt = format_prompt(input=raw_sample['input'], eos_token=self.tokenizer.eos_token, model_type=self.model_type)
         input_ids = self.tokenize(prompt)
         return {
             'input_ids': input_ids,  # size = (L,)

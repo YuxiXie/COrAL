@@ -18,6 +18,7 @@ from transformers.cache_utils import Cache, DynamicCache
 from transformers.utils.doc import add_start_docstrings_to_model_forward, replace_return_docstrings
 
 from oa_dag.models.oa_model import OAModelMixin, OAModelOutput, BaseModelOutputWithPastOA
+from oa_dag.configs.constants import IGNORE_INDEX
 
 logger = logging.get_logger(__name__)
 
@@ -547,6 +548,9 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
         position_ids: torch.LongTensor | None = None,
         positions_to_replace: torch.LongTensor | None = None,  # (B, 1)
         position_ids_to_predict: torch.LongTensor | None = None,    # (B, N)
+        topk_probs: torch.FloatTensor | None = None,    # (B, M, K)
+        topk_ids: torch.LongTensor | None = None,   # (B, M, K)
+        replace_indexes: torch.LongTensor | None = None,
         past_key_values: list[torch.FloatTensor] | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
@@ -600,6 +604,24 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
             position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
         else:
             position_ids = position_ids.view(-1, seq_length).long()
+        
+        if topk_ids is not None:
+            # concatenate original input with noisy self-generations
+            concat_input_ids = torch.cat((input_ids, topk_ids.view(input_ids.size(0), -1).contiguous()), dim=1).contiguous()
+            # get embeddings
+            concat_inputs_embeds = self.model.embed_tokens(concat_input_ids)
+            orig_inputs_embeds = concat_inputs_embeds[:, :input_ids.size(-1), :].contiguous()
+            noisy_inputs_embeds = concat_inputs_embeds[:, input_ids.size(-1):, :].contiguous().view(input_ids.size(0), -1, topk_ids.size(-1), concat_inputs_embeds.size(-1)).contiguous()
+            # get weighted embeddings
+            weighted_noisy_inputs_embeds = topk_probs.unsqueeze(-1).type(noisy_inputs_embeds.dtype).contiguous() * noisy_inputs_embeds
+            weighted_noisy_inputs_embeds = weighted_noisy_inputs_embeds.sum(dim=-2) / topk_probs.sum(dim=-1).unsqueeze(-1).type(noisy_inputs_embeds.dtype)
+            # replace original ones with weighted embeddings
+            for i in range(input_ids.size(0)):
+                replace_indexes_i = replace_indexes[i][replace_indexes[i].ge(0).nonzero().squeeze(dim=-1)]
+                if labels[i][replace_indexes_i].ne(IGNORE_INDEX).any().item():
+                    orig_inputs_embeds[i][replace_indexes_i] = weighted_noisy_inputs_embeds[i][:replace_indexes_i.size(-1), :].contiguous()
+            inputs_embeds = orig_inputs_embeds.contiguous()
+            input_ids = None
         
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
@@ -767,11 +789,11 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
             for bid in range(input_ids.size(0)):
                 # append the tokens to keep
                 if denoising:
-                    cur_input_ids = raw_input_ids[bid][raw_input_ids[bid].ne(tokenizer.pad_token_id).nonzero().squeeze()]
-                    cur_position_ids = position_ids[bid][raw_input_ids[bid].ne(tokenizer.pad_token_id).nonzero().squeeze()]
+                    cur_input_ids = raw_input_ids[bid][raw_input_ids[bid].ne(tokenizer.pad_token_id).nonzero().squeeze(dim=-1)]
+                    cur_position_ids = position_ids[bid][raw_input_ids[bid].ne(tokenizer.pad_token_id).nonzero().squeeze(dim=-1)]
                 else:
-                    cur_input_ids = input_ids[bid][attention_mask[bid].nonzero().squeeze()]
-                    cur_position_ids = position_ids[bid][attention_mask[bid].nonzero().squeeze()]
+                    cur_input_ids = input_ids[bid][attention_mask[bid].nonzero().squeeze(dim=-1)]
+                    cur_position_ids = position_ids[bid][attention_mask[bid].nonzero().squeeze(dim=-1)]
                 add_input_ids = tokens[bid][tokens_to_keep[bid]]
                 add_position_ids = position_ids_to_predict[bid][tokens_to_keep[bid]]
                 new_input_ids = torch.cat((cur_input_ids, add_input_ids), dim=-1)

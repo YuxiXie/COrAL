@@ -55,6 +55,11 @@ def parse_arguments() -> argparse.Namespace:
     # Dataset
     dataset_parser = parser.add_argument_group('dataset')
     dataset_parser.add_argument(
+        '--model_type',
+        type=str,
+        default='mistral-instruct',
+    )
+    dataset_parser.add_argument(
         '--train_datasets',
         type=parse_dataset,
         nargs='+',

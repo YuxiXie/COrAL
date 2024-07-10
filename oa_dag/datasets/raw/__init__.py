@@ -33,6 +33,8 @@ from oa_dag.datasets.raw.safe_rlhf import (
 
 from oa_dag.datasets.raw.diy_distilled import DistrilledDataset, DistrilledDatasetEval
 
+from oa_dag.datasets.raw.math import MetaMathDataset
+
 
 __all__ = [
     'AlpacaDataset',
@@ -51,4 +53,6 @@ __all__ = [
     
     'DistrilledDataset',
     'DistrilledDatasetEval',
+    
+    'MetaMathDataset',
 ]

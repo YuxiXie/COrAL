@@ -56,7 +56,7 @@ class SafetyPreferenceBatch(TypedDict, total=True):
 
 class SafetyPreferenceDataset(TokenizedDataset):
     def preprocess(self, raw_sample: RawSample) -> SafetyPreferenceSample:
-        prompt = format_prompt(input=raw_sample['input'], eos_token=self.tokenizer.eos_token)
+        prompt = format_prompt(input=raw_sample['input'], eos_token=self.tokenizer.eos_token, model_type=self.model_type)
         answer = raw_sample['answer']
         other_answer = raw_sample['other_answer']
         safer = raw_sample['safer']

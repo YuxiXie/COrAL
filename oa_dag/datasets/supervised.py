@@ -20,7 +20,7 @@ from typing_extensions import TypedDict  # Python 3.10+
 
 import torch
 
-from oa_dag.configs import IGNORE_INDEX, PROMPT_ASSISTANT, PROMPT_BEGIN, PROMPT_USER
+from oa_dag.configs import IGNORE_INDEX, PROMPT_ASSISTANT, PROMPT_BEGIN, PROMPT_USER, PROMPT_DICTS
 from oa_dag.datasets.base import CollatorBase, RawSample, TokenizedDataset
 from oa_dag.datasets.utils import format_prompt, right_padding
 
@@ -55,7 +55,7 @@ class SupervisedDataset(TokenizedDataset):
             input = raw_sample['input']  # pylint: disable=redefined-builtin
             if not isinstance(input, str):
                 raise ValueError(f'Unsupported type of `input`: {type(input)}. Expected: str.')
-            prompt = format_prompt(input=input, eos_token=self.tokenizer.eos_token)
+            prompt = format_prompt(input=input, eos_token=self.tokenizer.eos_token, model_type=self.model_type)
             answer = raw_sample['answer']
             text = prompt + answer + self.tokenizer.eos_token
 
@@ -65,14 +65,19 @@ class SupervisedDataset(TokenizedDataset):
             labels[: len(self.tokenize(prompt))] = IGNORE_INDEX
             return {'input_ids': input_ids, 'labels': labels}
 
+        prompt_begin, prompt_user, prompt_assistant = PROMPT_BEGIN, PROMPT_USER, PROMPT_ASSISTANT
+        if self.model_type != 'mistral-instruct' and self.model_type in PROMPT_DICTS:
+            prompt_begin, prompt_user, prompt_assistant = \
+                PROMPT_DICTS[self.model_type]['prompt_begin'], PROMPT_DICTS[self.model_type]['prompt_user'], PROMPT_DICTS[self.model_type]['prompt_assistant']
+        
         dialogue = raw_sample['dialogue']  # is not None
-        text = PROMPT_BEGIN
+        text = prompt_begin
         offsets = [0]
         input_ids = torch.empty(0, dtype=torch.long)
         for i, line in enumerate(dialogue):
             if i % 2 == 0:
                 # User input
-                text += PROMPT_USER.format(input=line) + PROMPT_ASSISTANT
+                text += prompt_user.format(input=line) + prompt_assistant
             else:
                 # Assistant input
                 text += line + self.tokenizer.eos_token

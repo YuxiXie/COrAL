@@ -217,6 +217,7 @@ class TokenizedDataset(Dataset[Dict[str, torch.Tensor]]):
             dict[str, float | dict[str, Any]] | Iterable[tuple[str, float | dict[str, Any]]]
         ),
         tokenizer: transformers.PreTrainedTokenizerBase,
+        model_type: str = 'mistral-instruct',
         lazy_tokenization: bool = True,
         seed: int = 42,
     ) -> None:
@@ -262,6 +263,7 @@ class TokenizedDataset(Dataset[Dict[str, torch.Tensor]]):
             self.raw_datasets.append(raw_dataset)
 
         self.tokenizer = tokenizer
+        self.model_type = model_type
         self.seed = seed
 
         merged_rawdata = self._merge_raw_datasets(seed=seed)
