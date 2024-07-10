@@ -5,7 +5,7 @@ import time
 # Set the threshold for the required free memory (in MB) to start the experiment
 # MEMORY_THRESHOLD_MB = 40960
 # MEMORY_THRESHOLD_MB = 46068
-MEMORY_THRESHOLD_MB = 10240
+MEMORY_THRESHOLD_MB = 40960
 
 def get_free_gpu_memory():
     """Get the free GPU memory in MB."""
@@ -37,7 +37,7 @@ if __name__ == "__main__":
     while True:
         free_memory = get_free_gpu_memory()
         sorted_memory = sorted(enumerate(free_memory), key=lambda x:x[1], reverse=True)
-        sorted_memory = [x for x in sorted_memory if x[0] not in []]
+        sorted_memory = [x for x in sorted_memory if x[0] not in [ ]]
         
         if sorted_memory[0][1] > MEMORY_THRESHOLD_MB - 1024:
             print("Running on gpu", sorted_memory[0][0])
@@ -46,5 +46,5 @@ if __name__ == "__main__":
         else:
             print("Waiting for enough GPU memory. Current free memory: {} GB".format(sum(free_memory) / 1024))
             print(sorted_memory)
-            time.sleep(100)  # Check every 100 seconds
+            time.sleep(120)  # Check every 100 seconds
 

@@ -15,7 +15,7 @@ export LOGLEVEL="${LOGLEVEL:-WARNING}"
 # MODEL_NAME_OR_PATH="huggyllama/llama-7b"
 # MODEL_NAME_OR_PATH="mistralai/Mistral-7B-v0.3"
 MODEL_NAME_OR_PATH="mistralai/Mistral-7B-Instruct-v0.2"
-OUTPUT_DIR="/share/edc/home/yuxi_xie/oa_dag/checkpoints/v0705/oa-denoise-mu0.15to0.75-dymin-rmu1.0-r0.15"
+OUTPUT_DIR="/share/edc/home/yuxi_xie/oa_dag/checkpoints/v0705/oa-denoiseonline-mu0.25to0.75-dymin-rmu1.0-r0.15"
 unset HOSTFILE
 ZERO_STAGE=3
 OFFLOAD="optimizer"
@@ -56,7 +56,7 @@ deepspeed --include localhost:$gpu_vis --master_port $MASTER_PORT \
 	--epochs 3 \
 	--save_interval 10240 \
 	--dynamic_mask_ratio_mu \
-	--min_mask_ratio_mu 0.15 \
+	--min_mask_ratio_mu 0.25 \
 	--max_mask_ratio_mu 0.75 \
 	--reconstruct \
 	--replace_ratio_mu 0.15 \
@@ -81,5 +81,4 @@ deepspeed --include localhost:$gpu_vis --master_port $MASTER_PORT \
 # --exclude_l2r_order \
 # --tune_final_layer_only \
 
-# bash scripts/sft-sharegpt-mage.sh
-
+bash scripts/sft-sharegpt-math.sh

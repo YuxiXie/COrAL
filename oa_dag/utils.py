@@ -38,7 +38,7 @@ from transformers import PreTrainedTokenizerBase
 from transformers.modeling_outputs import ModelOutput
 from transformers.tokenization_utils import BatchEncoding, PaddingStrategy, TruncationStrategy
 
-from oa_dag.configs.constants import PROMPT_ASSISTANT
+from oa_dag.configs.constants import PROMPT_ASSISTANT, IGNORE_INDEX
 
 
 __all__ = [
@@ -259,6 +259,13 @@ def get_all_reduce_max(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def get_all_reduce_min(tensor: torch.Tensor) -> torch.Tensor:
+    """Perform all-reduce operation on a tensor cross all ranks and return the max."""
+    if dist.is_initialized():
+        dist.all_reduce(tensor, op=dist.ReduceOp.MIN)
+    return tensor
+
+
 def get_optimizer_grouped_parameters(
     module: nn.Module,
     weight_decay: float,
@@ -314,4 +321,12 @@ def get_variable_generator(mu_value=0.5, stderr=0.25, min_value=0.0, max_value=1
         loc=mu_value, scale=stderr,
     )
     return generator
-    
+
+
+def pad_tensors(tensors, pad_value=IGNORE_INDEX):
+    max_len = max([len(x) for x in tensors])
+    for i in range(len(tensors)):
+        pad_len = max_len - len(tensors[i])
+        tmp = torch.ones((pad_len,), dtype=torch.long, device=tensors[i].device)
+        tensors[i] = torch.cat((tensors[i], tmp * pad_value), dim=-1).long()
+    return torch.stack(tensors, dim=0)
