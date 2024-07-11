@@ -251,7 +251,8 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 predictions.extend(sequences)
                 text = self.tokenizer.batch_decode(batch['input_ids'], skip_special_tokens=True)
                 texts.extend(text)
-                if cnt >= 100: break
+                # import ipdb; ipdb.set_trace()
+                if cnt >= 5: break
             else:
                 loss = self.eval_step(**batch)
                 for pid, values in loss.items():
@@ -278,7 +279,10 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                     counts[key] = torch.tensor(0, device=self.args.device)
                 # dist.reduce(losses[key], dst=0, op=dist.ReduceOp.SUM)
                 # dist.reduce(counts[key], dst=0, op=dist.ReduceOp.SUM)
-                losses[key] = losses[key].sum().item() / counts[key].sum().item()
+                if counts[key].sum().item() > 0:
+                    losses[key] = losses[key].sum().item() / counts[key].sum().item()
+                else:
+                    losses[key] = -1
             dist.barrier()
             
             # if is_main_process():
@@ -571,7 +575,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         
         ##=== add noise by weighted embeddings ===##
         topk_probs, topk_ids = None, None
-        if len(replace_position_ids) and replace_count_min > 0:
+        if not self.args.random_noise and len(replace_position_ids) and replace_count_min > 0:
             topk_probs, topk_ids = self.collect_noisy_inputs(
                 input_ids,
                 attention_mask,

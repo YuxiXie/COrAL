@@ -18,6 +18,7 @@ from transformers.cache_utils import Cache, DynamicCache
 from transformers.utils.doc import add_start_docstrings_to_model_forward, replace_return_docstrings
 
 from oa_dag.models.oa_model import OAModelMixin, OAModelOutput, BaseModelOutputWithPastOA
+from oa_dag.utils import pad_tensors
 from oa_dag.configs.constants import IGNORE_INDEX
 
 logger = logging.get_logger(__name__)
@@ -618,7 +619,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
             # replace original ones with weighted embeddings
             for i in range(input_ids.size(0)):
                 replace_indexes_i = replace_indexes[i][replace_indexes[i].ge(0).nonzero().squeeze(dim=-1)]
-                if labels[i][replace_indexes_i].ne(IGNORE_INDEX).any().item():
+                if labels is None or labels[i][replace_indexes_i].ne(IGNORE_INDEX).any().item():
                     orig_inputs_embeds[i][replace_indexes_i] = weighted_noisy_inputs_embeds[i][:replace_indexes_i.size(-1), :].contiguous()
             inputs_embeds = orig_inputs_embeds.contiguous()
             input_ids = None
@@ -713,7 +714,8 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
         min_n_tokens: int = 1,
         max_n_tokens: int = 1,
         do_sample: bool = False,
-        denoising: bool = False
+        denoising: bool = False,
+        topk: int = 8,
     ):
         assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
         
@@ -740,6 +742,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
         raw_input_ids = input_ids.clone().detach()
         tracks = []
         keep_generate, accumulated_n_tokens = True, 0
+        topk_probs, topk_ids, replace_indexes = None, None, None
         while keep_generate:
             # forward pass to get tokens at position_ids_to_predict
             n_tokens_to_keep = min(max(min_n_tokens, accumulated_n_tokens), position_ids_to_predict.size(-1), max_n_tokens)
@@ -750,6 +753,9 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
                 position_ids=position_ids, 
                 positions_to_replace=positions_to_replace,
                 position_ids_to_predict=position_ids_to_predict,
+                topk_probs=topk_probs,
+                topk_ids=topk_ids,
+                replace_indexes=replace_indexes,
                 return_dict=True,
             ).logits[:, input_ids.size(-1):].contiguous()
             # topk_labels = torch.topk(logits, k=10, dim=-1).indices
@@ -758,80 +764,98 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
             token_scores = processors(input_ids, logits.view(-1, logits.size(-1)))
             token_scores = warpers(input_ids, token_scores)
             probs = nn.functional.softmax(token_scores, dim=-1)
-            # sample and get candidate tokens
-            tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-            try:
-                scores = torch.stack([probs[idx, tokens[idx]] for idx in range(tokens.size(0))], dim=0)
-            except:
-                import ipdb; ipdb.set_trace()
-            tokens = tokens.view(input_ids.size(0), -1)
-            scores = scores.view(input_ids.size(0), -1)
-            # keep tokens with the highest scores
-            scores[position_ids_to_predict.eq(0)] = -math.inf
-            _, sorted_ids = torch.sort(scores, dim=-1, descending=True)
-            ############### TODO: keep strategy ###############
-            n = accumulated_n_tokens if denoising else n_tokens_to_keep
-            if not do_sample:
-                tokens_to_keep = sorted_ids[:, :n]
+            
+            if denoising:
+                results = torch.topk(nn.functional.softmax(logits, dim=-1), k=topk, dim=-1)
+                topk_probs, topk_ids = results.values[:, :accumulated_n_tokens, :], results.indices[:, :accumulated_n_tokens, :]
+                if position_ids_to_predict[:, :accumulated_n_tokens].max() + 1 > input_ids.size(-1):
+                    replace_indexes = position_ids_to_predict[:, :accumulated_n_tokens]
+                    input_ids = pad_tensors(input_ids, max_len=position_ids_to_predict[:, :accumulated_n_tokens].max() + 1, pad_value=tokenizer.pad_token_id)
+                    attention_mask = pad_tensors(attention_mask, max_len=position_ids_to_predict[:, :accumulated_n_tokens].max() + 1, pad_value=True).bool()
+                    position_ids = None     # torch.cat((position_ids, replace_indexes), dim=-1)
+                    positions_to_replace = (position_ids_to_predict[:, :accumulated_n_tokens].max(dim=-1).values + 1).long().unsqueeze(-1)
+                input_ids[0][replace_indexes[0]] = torch.multinomial(probs[:accumulated_n_tokens, ...], num_samples=1).squeeze(1)
+                tracks.append([
+                    input_ids[0][replace_indexes[0]].clone().tolist(),
+                    replace_indexes[0].clone().tolist()
+                ])
             else:
-                tokens_to_keep = sorted_ids[:, :int(n * 2)]
-                random_noise = torch.rand_like(tokens_to_keep, dtype=torch.float)
-                _, sorted_ids = torch.sort(random_noise, dim=-1)
-                tokens_to_keep = torch.stack([tokens_to_keep[bid][sorted_ids[bid, :n]] for bid in range(sorted_ids.size(0))], dim=0)
-            ###################################################
-            
-            new_input_ids_list = []
-            new_position_ids_list = []
-            new_positions_to_replace_list = []
-            new_position_ids_to_predict_list = []
-            new_max_length = 0
-            cur_step = []
-            for bid in range(input_ids.size(0)):
-                # append the tokens to keep
-                if denoising:
-                    cur_input_ids = raw_input_ids[bid][raw_input_ids[bid].ne(tokenizer.pad_token_id).nonzero().squeeze(dim=-1)]
-                    cur_position_ids = position_ids[bid][raw_input_ids[bid].ne(tokenizer.pad_token_id).nonzero().squeeze(dim=-1)]
+                # sample and get candidate tokens
+                tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+                try:
+                    scores = torch.stack([probs[idx, tokens[idx]] for idx in range(tokens.size(0))], dim=0)
+                except:
+                    import ipdb; ipdb.set_trace()
+                tokens = tokens.view(input_ids.size(0), -1)
+                scores = scores.view(input_ids.size(0), -1)
+                # keep tokens with the highest scores
+                scores[position_ids_to_predict.eq(0)] = -math.inf
+                _, sorted_ids = torch.sort(scores, dim=-1, descending=True)
+                ############### TODO: keep strategy ###############
+                n = accumulated_n_tokens if denoising else n_tokens_to_keep
+                if not do_sample:
+                    tokens_to_keep = sorted_ids[:, :n]
                 else:
-                    cur_input_ids = input_ids[bid][attention_mask[bid].nonzero().squeeze(dim=-1)]
-                    cur_position_ids = position_ids[bid][attention_mask[bid].nonzero().squeeze(dim=-1)]
-                add_input_ids = tokens[bid][tokens_to_keep[bid]]
-                add_position_ids = position_ids_to_predict[bid][tokens_to_keep[bid]]
-                new_input_ids = torch.cat((cur_input_ids, add_input_ids), dim=-1)
-                new_position_ids = torch.cat((cur_position_ids, add_position_ids), dim=-1)
-                # sort the inputs into the ascending order
-                _, tmp_idx = new_position_ids.sort()
-                new_input_ids = new_input_ids[tmp_idx]
-                new_position_ids = new_position_ids[tmp_idx]
-                cur_step.append([new_input_ids[raw_input_ids[bid].ne(tokenizer.pad_token_id).sum():].tolist(), 
-                                 new_position_ids[raw_input_ids[bid].ne(tokenizer.pad_token_id).sum():].tolist()])
-                # update the positions to predict
-                new_position_ids_to_predict = [x for x in position_ids_to_predict[bid] if x not in add_position_ids]
-                if sum(new_position_ids_to_predict) <= 0: continue
-                new_position_ids_to_predict = torch.stack(new_position_ids_to_predict, dim=0)
+                    tokens_to_keep = sorted_ids[:, :int(n * 2)]
+                    random_noise = torch.rand_like(tokens_to_keep, dtype=torch.float)
+                    _, sorted_ids = torch.sort(random_noise, dim=-1)
+                    tokens_to_keep = torch.stack([tokens_to_keep[bid][sorted_ids[bid, :n]] for bid in range(sorted_ids.size(0))], dim=0)
+                ###################################################
                 
-                new_input_ids_list.append(new_input_ids)
-                new_position_ids_list.append(new_position_ids)
-                new_positions_to_replace_list.append(torch.tensor(new_input_ids.size(-1), dtype=torch.long, device=new_input_ids.device).unsqueeze(-1))
-                new_position_ids_to_predict_list.append(new_position_ids_to_predict)
-                new_max_length = max(new_max_length, new_input_ids.size(-1))
-            for bid in range(len(new_input_ids_list)):
-                pad_len = new_max_length - new_input_ids_list[bid].size(-1)
-                tmp = torch.ones((pad_len,), dtype=torch.long, device=new_input_ids_list[bid].device)
-                new_input_ids_list[bid] = torch.cat((new_input_ids_list[bid], tmp * tokenizer.pad_token_id), dim=-1).long()
-                new_position_ids_list[bid] = torch.cat((new_position_ids_list[bid], tmp * 0), dim=-1).long()
-            
-            tracks.append(cur_step[0])
-            if len(new_input_ids_list) <= 0: break
-            
-            input_ids = torch.stack(new_input_ids_list, dim=0)
-            attention_mask = input_ids.ne(tokenizer.pad_token_id)
-            position_ids = torch.stack(new_position_ids_list, dim=0)
-            positions_to_replace = torch.stack(new_positions_to_replace_list, dim=0)
-            if not denoising:
-                position_ids_to_predict = torch.stack(new_position_ids_to_predict_list, dim=0)
-            
-        #     print(tokenizer.decode(input_ids[0]))
-        #     import ipdb; ipdb.set_trace()
+                new_input_ids_list = []
+                new_position_ids_list = []
+                new_positions_to_replace_list = []
+                new_position_ids_to_predict_list = []
+                new_max_length = 0
+                cur_step = []
+                for bid in range(input_ids.size(0)):
+                    # append the tokens to keep
+                    if denoising:
+                        cur_input_ids = raw_input_ids[bid][raw_input_ids[bid].ne(tokenizer.pad_token_id).nonzero().squeeze(dim=-1)]
+                        cur_position_ids = position_ids[bid][raw_input_ids[bid].ne(tokenizer.pad_token_id).nonzero().squeeze(dim=-1)]
+                    else:
+                        cur_input_ids = input_ids[bid][attention_mask[bid].nonzero().squeeze(dim=-1)]
+                        cur_position_ids = position_ids[bid][attention_mask[bid].nonzero().squeeze(dim=-1)]
+                    add_input_ids = tokens[bid][tokens_to_keep[bid]]
+                    add_position_ids = position_ids_to_predict[bid][tokens_to_keep[bid]]
+                    new_input_ids = torch.cat((cur_input_ids, add_input_ids), dim=-1)
+                    new_position_ids = torch.cat((cur_position_ids, add_position_ids), dim=-1)
+                    # sort the inputs into the ascending order
+                    _, tmp_idx = new_position_ids.sort()
+                    new_input_ids = new_input_ids[tmp_idx]
+                    new_position_ids = new_position_ids[tmp_idx]
+                    cur_step.append([new_input_ids[raw_input_ids[bid].ne(tokenizer.pad_token_id).sum():].tolist(), 
+                                    new_position_ids[raw_input_ids[bid].ne(tokenizer.pad_token_id).sum():].tolist()])
+                    # update the positions to predict
+                    new_position_ids_to_predict = [x for x in position_ids_to_predict[bid] if x not in add_position_ids]
+                    if sum(new_position_ids_to_predict) <= 0: continue
+                    new_position_ids_to_predict = torch.stack(new_position_ids_to_predict, dim=0)
+                    
+                    new_input_ids_list.append(new_input_ids)
+                    new_position_ids_list.append(new_position_ids)
+                    new_positions_to_replace_list.append(torch.tensor(new_input_ids.size(-1), dtype=torch.long, device=new_input_ids.device).unsqueeze(-1))
+                    new_position_ids_to_predict_list.append(new_position_ids_to_predict)
+                    new_max_length = max(new_max_length, new_input_ids.size(-1))
+                for bid in range(len(new_input_ids_list)):
+                    pad_len = new_max_length - new_input_ids_list[bid].size(-1)
+                    tmp = torch.ones((pad_len,), dtype=torch.long, device=new_input_ids_list[bid].device)
+                    new_input_ids_list[bid] = torch.cat((new_input_ids_list[bid], tmp * tokenizer.pad_token_id), dim=-1).long()
+                    new_position_ids_list[bid] = torch.cat((new_position_ids_list[bid], tmp * 0), dim=-1).long()
+                
+                tracks.append(cur_step[0])
+                if len(new_input_ids_list) <= 0: break
+                
+                input_ids = torch.stack(new_input_ids_list, dim=0)
+                attention_mask = input_ids.ne(tokenizer.pad_token_id)
+                position_ids = torch.stack(new_position_ids_list, dim=0)
+                positions_to_replace = torch.stack(new_positions_to_replace_list, dim=0)
+                if not denoising:
+                    position_ids_to_predict = torch.stack(new_position_ids_to_predict_list, dim=0)
+                
+            print(tokenizer.decode(input_ids[0]))
+            if '</s>' in tokenizer.decode(input_ids[0]) and '\n#### ' in tokenizer.decode(input_ids[0]): break
+            if accumulated_n_tokens > position_ids_to_predict.max().item() + 5: break
+            # import ipdb; ipdb.set_trace()
         # import ipdb; ipdb.set_trace()
         
         return tracks, input_ids

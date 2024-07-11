@@ -16,10 +16,10 @@ export LOGLEVEL="${LOGLEVEL:-WARNING}"
 # MODEL_NAME_OR_PATH="mistralai/Mistral-7B-v0.3"
 # MODEL_NAME_OR_PATH="mistralai/Mistral-7B-Instruct-v0.2"
 MODEL_NAME_OR_PATH="meta-math/MetaMath-Mistral-7B"
-OUTPUT_DIR="/share/edc/home/yuxi_xie/oa_dag/checkpoints/v0705-math/oa-denoiseonline-mu0.25to0.75-dymin-rmu1.0-r0.15"
+OUTPUT_DIR="/share/edc/home/yuxi_xie/oa_dag/checkpoints/v0705-math/oa-denoise-mu0.55-rmu1.0-r0.15"
 unset HOSTFILE
 ZERO_STAGE=3
-OFFLOAD="optimizer"
+OFFLOAD="none"
 
 mkdir -p "${OUTPUT_DIR}"
 OUTPUT_DIR="$(cd "${OUTPUT_DIR}" &>/dev/null && pwd)"
@@ -29,7 +29,7 @@ fi
 
 cp -f "$0" "${OUTPUT_DIR}/script.sh"
 
-export WANDB_MODE=dryrun
+export WANDB_MODE=online
 export WANDB_API_KEY="1396a7d2a29a8e8241dff6e0e6371f2ad61e11e2"
 if [[ -z "${WANDB_API_KEY}" ]]; then
 	export WANDB_MODE="offline"
@@ -46,7 +46,7 @@ MASTER_PORT="$(
 
 exec 1> >(tee "${OUTPUT_DIR}/stdout.log" >&1) 2> >(tee "${OUTPUT_DIR}/stderr.log" >&2)
 
-gpu_vis=7,6,5,4
+gpu_vis=3,2,1,0
 
 deepspeed --include localhost:$gpu_vis --master_port $MASTER_PORT \
 	--module oa_dag.algorithms.oa \
@@ -57,15 +57,13 @@ deepspeed --include localhost:$gpu_vis --master_port $MASTER_PORT \
 	--trust_remote_code True \
 	--epochs 3 \
 	--save_interval 10240 \
-	--dynamic_mask_ratio_mu \
-	--min_mask_ratio_mu 0.25 \
-	--max_mask_ratio_mu 0.75 \
 	--reconstruct \
+	--random_noise \
 	--replace_ratio_mu 0.15 \
 	--replace_with_prob 0.5 \
-	--per_device_train_batch_size 16 \
+	--per_device_train_batch_size 2 \
 	--per_device_eval_batch_size 4 \
-	--gradient_accumulation_steps 2 \
+	--gradient_accumulation_steps 16 \
 	--gradient_checkpointing \
 	--learning_rate 2e-5 \
 	--lr_scheduler_type cosine \

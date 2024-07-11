@@ -323,8 +323,10 @@ def get_variable_generator(mu_value=0.5, stderr=0.25, min_value=0.0, max_value=1
     return generator
 
 
-def pad_tensors(tensors, pad_value=IGNORE_INDEX):
-    max_len = max([len(x) for x in tensors])
+def pad_tensors(tensors, max_len=-1, pad_value=IGNORE_INDEX):
+    tensors = [x for x in tensors]
+    if max_len <= 0:
+        max_len = max([len(x) for x in tensors])
     for i in range(len(tensors)):
         pad_len = max_len - len(tensors[i])
         tmp = torch.ones((pad_len,), dtype=torch.long, device=tensors[i].device)

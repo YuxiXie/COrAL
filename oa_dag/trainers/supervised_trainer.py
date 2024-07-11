@@ -92,6 +92,7 @@ class SupervisedTrainer(TrainerBase):
         train_dataset = self.DATASET_TYPE(
             self.args.train_datasets,
             tokenizer=self.tokenizer,
+            model_type=self.args.model_type,
         )
 
         if self.args.need_eval:
@@ -103,6 +104,7 @@ class SupervisedTrainer(TrainerBase):
                 eval_dataset = self.EVAL_DATA_TYPE(
                     self.args.eval_datasets,
                     tokenizer=self.tokenizer,
+                    # model_type=self.args.model_type,
                 )
             else:
                 raise ValueError('Either `eval_datasets` or `eval_split_ratio` should be provided.')

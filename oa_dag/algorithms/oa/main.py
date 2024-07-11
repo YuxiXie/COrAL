@@ -79,6 +79,11 @@ def parse_arguments() -> argparse.Namespace:
     training_parser = parser.add_argument_group('training')
     # - for denoising
     training_parser.add_argument(
+        '--random_noise',
+        default=False,
+        action='store_true',
+    )
+    training_parser.add_argument(
         '--reconstruct',
         default=False,
         action='store_true',
