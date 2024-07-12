@@ -13,56 +13,13 @@ export PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export LOGLEVEL="${LOGLEVEL:-WARNING}"
 
 # MODEL_NAME_OR_PATH="huggyllama/llama-7b"
-MODEL_NAME_OR_PATH="mistralai/Mistral-7B-v0.3"
-OUTPUT_DIR="/share/edc/home/yuxi_xie/oa_dag/checkpoints/dev"
+# MODEL_NAME_OR_PATH="mistralai/Mistral-7B-v0.3"
+# MODEL_NAME_OR_PATH="meta-llama/Meta-Llama-3-8B"
+MODEL_NAME_OR_PATH="meta-llama/Llama-2-13b-hf"
+OUTPUT_DIR="/share/edc/home/yuxi_xie/oa_dag/checkpoints/sft/metamath-llama2-13b"
 unset HOSTFILE
-ZERO_STAGE=3
-OFFLOAD="optimizer"
-while [[ "$#" -gt 0 ]]; do
-	arg="$1"
-	shift
-	case "${arg}" in
-		--model_name_or_path)
-			MODEL_NAME_OR_PATH="$1"
-			shift
-			;;
-		--model_name_or_path=*)
-			MODEL_NAME_OR_PATH="${arg#*=}"
-			;;
-		--output_dir)
-			OUTPUT_DIR="$1"
-			shift
-			;;
-		--output_dir=*)
-			OUTPUT_DIR="${arg#*=}"
-			;;
-		--hostfile)
-			HOSTFILE="$1"
-			shift
-			;;
-		--hostfile=*)
-			HOSTFILE="${arg#*=}"
-			;;
-		--zero_stage)
-			ZERO_STAGE="$1"
-			shift
-			;;
-		--zero_stage=*)
-			ZERO_STAGE="${arg#*=}"
-			;;
-		--offload)
-			OFFLOAD="$1"
-			shift
-			;;
-		--offload=*)
-			OFFLOAD="${arg#*=}"
-			;;
-		*)
-			echo "Unknown parameter passed: '${arg}'" >&2
-			exit 1
-			;;
-	esac
-done
+ZERO_STAGE=2
+OFFLOAD="all"
 
 mkdir -p "${OUTPUT_DIR}"
 OUTPUT_DIR="$(cd "${OUTPUT_DIR}" &>/dev/null && pwd)"
@@ -72,6 +29,8 @@ fi
 
 cp -f "$0" "${OUTPUT_DIR}/script.sh"
 
+export WANDB_MODE=online
+export WANDB_API_KEY="1396a7d2a29a8e8241dff6e0e6371f2ad61e11e2"
 if [[ -z "${WANDB_API_KEY}" ]]; then
 	export WANDB_MODE="offline"
 fi
@@ -85,26 +44,22 @@ MASTER_PORT="$(
 		shuf | head -n 1
 )"
 
-DEEPSPEED_ARGS=()
-if [[ -n "${HOSTFILE+x}" ]]; then
-	DEEPSPEED_ARGS+=("--hostfile" "${HOSTFILE}")
-fi
-DEEPSPEED_ARGS+=("--master_port" "${MASTER_PORT}")
-
 exec 1> >(tee "${OUTPUT_DIR}/stdout.log" >&1) 2> >(tee "${OUTPUT_DIR}/stderr.log" >&2)
 
-# deepspeed "${DEEPSPEED_ARGS[@]}" \
-gpu_vis=7
+gpu_vis=2
 
 deepspeed --include localhost:$gpu_vis --master_port $MASTER_PORT \
-	--module oa_dag.algorithms.oa \
-	--train_datasets alpaca \
+	--module oa_dag.finetune \
+	--train_datasets MetaMath \
+	--model_type metamath \
 	--model_name_or_path "${MODEL_NAME_OR_PATH}" \
-	--max_length 512 \
+	--max_length 1024 \
 	--trust_remote_code True \
 	--epochs 3 \
-	--per_device_train_batch_size 8 \
+	--per_device_train_batch_size 2 \
 	--per_device_eval_batch_size 4 \
+	--gradient_accumulation_steps 16 \
+	--gradient_checkpointing \
 	--learning_rate 2e-5 \
 	--lr_scheduler_type cosine \
 	--lr_warmup_ratio 0.03 \
@@ -112,11 +67,8 @@ deepspeed --include localhost:$gpu_vis --master_port $MASTER_PORT \
 	--seed 42 \
 	--output_dir "${OUTPUT_DIR}" \
 	--log_type wandb \
-	--log_project Safe-RLHF-SFT \
+	--log_project OA-SFT \
 	--zero_stage "${ZERO_STAGE}" \
 	--offload "${OFFLOAD}" \
 	--bf16 True \
 	--tf32 True
-
-# --gradient_accumulation_steps 4 \
-# --gradient_checkpointing \

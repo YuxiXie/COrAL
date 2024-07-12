@@ -93,6 +93,7 @@ class SupervisedTrainer(TrainerBase):
             self.args.train_datasets,
             tokenizer=self.tokenizer,
             model_type=self.args.model_type,
+            lazy_tokenization=self.args.lazy_tokenization,
         )
 
         if self.args.need_eval:
@@ -185,18 +186,8 @@ class SupervisedTrainer(TrainerBase):
         """Perform a single training step."""
         raise NotImplementedError
     
-    @abc.abstractmethod
-    def vanilla_shuffle_train_step(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        """Perform a single training step."""
-        raise NotImplementedError
-
-    @abc.abstractmethod
-    @torch.no_grad()
-    def masking(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise NotImplementedError
-    
     def create_oa_batch(self, batch: TokenizedDataset) -> dict[str, Any]:
-        return self.masking(**batch)
+        return batch
     
     def train(self) -> None:
         """Train the model."""
@@ -239,8 +230,8 @@ class SupervisedTrainer(TrainerBase):
                 
                 ##=== generate batch (with noise) ===##
                 self.set_eval()
-                if self.args.vanilla_shuffle:
-                    oa_batch = batch
+                if self.TRAINING_TYPE == 'sft' or self.args.vanilla_shuffle:
+                    oa_batch = to_device(batch, self.args.device)
                 else:
                     oa_batch = self.create_oa_batch(to_device(batch, self.args.device))
                 torch.cuda.empty_cache()
@@ -248,7 +239,9 @@ class SupervisedTrainer(TrainerBase):
                 ##=== training ===##
                 self.set_train()
                 # info = self.train_step(**to_device(batch, self.args.device))
-                if self.args.vanilla_shuffle:
+                if self.TRAINING_TYPE == 'sft':
+                    info = self.train_step(**oa_batch)
+                elif self.args.vanilla_shuffle:
                     info = self.vanilla_shuffle_train_step(**oa_batch)
                 else:
                     info = self.train_step(**oa_batch)

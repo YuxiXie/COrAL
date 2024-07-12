@@ -46,6 +46,11 @@ def parse_arguments() -> argparse.Namespace:
         required=True,
     )
     model_parser.add_argument(
+        '--resume_from_ckpt',
+        type=str,
+        default=None,
+    )
+    model_parser.add_argument(
         '--max_length',
         type=int,
         default=512,
@@ -61,6 +66,11 @@ def parse_arguments() -> argparse.Namespace:
     # Dataset
     dataset_parser = parser.add_argument_group('dataset')
     dataset_parser.add_argument(
+        '--model_type',
+        type=str,
+        default='mistral-instruct',
+    )
+    dataset_parser.add_argument(
         '--train_datasets',
         type=parse_dataset,
         nargs='+',
@@ -74,6 +84,11 @@ def parse_arguments() -> argparse.Namespace:
         nargs='+',
         metavar='DATASET[:PROPORTION[:PATH]]',
         help='Dataset name(s) registered in the raw dataset.',
+    )
+    dataset_parser.add_argument(
+        '--not_lazy_tokenization',
+        default=False,
+        action='store_true',
     )
 
     # Training
@@ -274,6 +289,7 @@ def parse_arguments() -> argparse.Namespace:
         )
     if args.tf32 is not None and is_torch_tf32_available():
         torch.backends.cuda.matmul.allow_tf32 = args.tf32
+    args.lazy_tokenization = not args.not_lazy_tokenization
 
     return args
 
