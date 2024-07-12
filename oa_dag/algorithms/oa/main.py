@@ -74,6 +74,11 @@ def parse_arguments() -> argparse.Namespace:
         metavar='DATASET[:PROPORTION[:PATH]]',
         help='Dataset name(s) registered in the raw dataset.',
     )
+    dataset_parser.add_argument(
+        '--not_lazy_tokenization',
+        default=False,
+        action='store_true',
+    )
 
     # Training
     training_parser = parser.add_argument_group('training')
@@ -446,6 +451,7 @@ def parse_arguments() -> argparse.Namespace:
     
     if not args.tune_final_layer_only:
         args.tune_lm_head = True
+    args.lazy_tokenization = not args.not_lazy_tokenization
 
     return args
 

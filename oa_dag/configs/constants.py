@@ -44,7 +44,7 @@ PROMPT_DICT: dict[str, str] = {
 
 PROMPT_DICTS: dict[str, dict[str, str]] = {
     'mistral-instruct': PROMPT_DICT,
-    'mistral-metamath': {
+    'metamath': {
         'prompt_begin': 'Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n',
         'prompt_user': '### Instruction:\n{input}\n\n',
         'prompt_assistant': '### Response:'

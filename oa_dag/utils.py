@@ -332,3 +332,48 @@ def pad_tensors(tensors, max_len=-1, pad_value=IGNORE_INDEX):
         tmp = torch.ones((pad_len,), dtype=torch.long, device=tensors[i].device)
         tensors[i] = torch.cat((tensors[i], tmp * pad_value), dim=-1).long()
     return torch.stack(tensors, dim=0)
+
+
+def shuffle_and_mask(label_position_ids: torch.LongTensor, ratio_generator, left2right=False, device=None):
+    keep_sample = True
+    while keep_sample:
+        # sample to get masking threshold                    
+        mask_threshold = ratio_generator.rvs(1)[0]
+        if left2right:  # mask the right part
+            random_noise = torch.arange(0, label_position_ids.size(-1), dtype=torch.float, device=device)
+            random_noise = (-random_noise + label_position_ids.size(-1) - 0.5) / label_position_ids.size(-1)    # reverse to be descending
+        else:   # randomly mask
+            random_noise = torch.rand(label_position_ids.size(-1), device=device)
+        # extract the position ids of the tokens to mask
+        mask_label_position_ids = label_position_ids[random_noise.lt(mask_threshold).nonzero().squeeze(-1)]
+        if mask_label_position_ids.size(0) > 0 or label_position_ids.size(0) <= 0:
+            keep_sample = False
+    
+    return mask_label_position_ids, mask_threshold
+
+
+def add_noise(cur_input_ids: torch.LongTensor, cur_labels: torch.LongTensor, ratio_generator, 
+              replace_with_prob=1.0, device=None):
+    keep_sample = True
+    while keep_sample:
+        # sample the threshold for reconstruction
+        replace_threshold = ratio_generator.rvs(1)[0]
+        random_noise = torch.rand(cur_input_ids.size(-1), device=device)
+        if cur_labels.ne(IGNORE_INDEX).any().item():
+            # replace_ids = torch.logical_and(random_noise.lt(replace_threshold), cur_labels.ne(IGNORE_INDEX)).nonzero().squeeze(-1)    # TODO: original version - only re-predict part of the tokens
+            replace_ids = torch.logical_and(random_noise.le(1), cur_labels.ne(IGNORE_INDEX)).nonzero().squeeze(-1)  # TODO: re-predict all tokens
+        else:
+            replace_ids = random_noise.le(replace_threshold).nonzero().squeeze(-1)
+        if replace_ids.size(0) > 0:
+            keep_sample = False
+    
+    # replace input ids to reconstruct
+    new_replace_ids = None
+    if replace_with_prob < 1:
+        replace_with_prob = replace_threshold     # TODO: replace with higher probability when re-predicting all tokens
+        # replace with probability < 1, so otherwise it should remain the same
+        random_noise = torch.rand(replace_ids.size(-1), device=device)
+        new_replace_ids = replace_ids[random_noise.lt(replace_with_prob).nonzero().squeeze(-1)]
+    
+    return replace_ids, new_replace_ids, replace_threshold
+    

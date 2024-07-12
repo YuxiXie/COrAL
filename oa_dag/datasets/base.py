@@ -271,16 +271,16 @@ class TokenizedDataset(Dataset[Dict[str, torch.Tensor]]):
         if lazy_tokenization:
             self.data = [self._SENTINEL for _ in range(len(self.rawdata))]
         else:
-            self.data = list(
-                map(
+            self.data = [
+                data for data in map(
                     self.preprocess,
                     tqdm(
                         self.rawdata,
                         desc='Preprocessing raw dataset...',
                         disable=not is_main_process(),
                     ),
-                ),
-            )
+                ) if data['input_ids'].size(-1) <= self.tokenizer.model_max_length
+            ]
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         """Get a tokenized data sample by index."""
@@ -342,7 +342,8 @@ class TokenizedDataset(Dataset[Dict[str, torch.Tensor]]):
         text: str,
         add_special_tokens: bool = True,
         padding: bool | str | PaddingStrategy = PaddingStrategy.DO_NOT_PAD,
-        truncation: bool | str | TruncationStrategy = TruncationStrategy.LONGEST_FIRST,
+        # truncation: bool | str | TruncationStrategy = TruncationStrategy.LONGEST_FIRST,
+        truncation: bool | str | TruncationStrategy = False,
         max_length: int | None = None,
     ) -> torch.LongTensor:  # size = (L,)
         """Tokenize a text string into a tensor representation."""
