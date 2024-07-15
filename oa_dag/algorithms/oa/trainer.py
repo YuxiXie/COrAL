@@ -330,7 +330,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         if return_logits:
             return {
                 'loss': outputs.loss,
-                'logits': outputs.logits
+                'logits': outputs.logits.detach(),
             }
         return {
             'loss': outputs.loss,
@@ -384,12 +384,13 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         position_ids=torch.stack(position_ids_list, dim=0)
         positions_to_replace=torch.stack(positions_to_replace_list, dim=0).unsqueeze(-1)
         position_ids_to_predict=torch.stack(position_ids_to_predict_list, dim=0)
-        #################### sanity check ####################
-        idx = 0
-        _cur_input_ids, cur_position_ids = new_input_ids[idx], position_ids[idx]
-        vis_ids = [_cur_input_ids[cur_position_ids.eq(idx).nonzero()[0].item()].item() if idx in cur_position_ids else 583 for idx in range(cur_position_ids.min().item(), cur_position_ids.max().item() + 1)]
-        import ipdb; ipdb.set_trace()
-        ######################################################
+        # #################### sanity check ####################
+        # idx = 0
+        # _cur_input_ids, cur_position_ids = new_input_ids[idx], position_ids[idx]
+        # _id = self.tokenizer.encode('_')[-1]
+        # vis_ids = [_cur_input_ids[cur_position_ids.eq(idx).nonzero()[0].item()].item() if idx in cur_position_ids else _id for idx in range(cur_position_ids.min().item(), cur_position_ids.max().item() + 1)]
+        # import ipdb; ipdb.set_trace()
+        # ######################################################
         with torch.no_grad():
             logits = self.model(
                 input_ids=new_input_ids,
@@ -420,7 +421,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             mask_ratio_mu = self.args.min_mask_ratio_mu + (self.args.max_mask_ratio_mu - self.args.min_mask_ratio_mu) * (self.global_step / len(self.train_dataloader) / self.args.epochs)
             # mask_ratio_min = self.args.mask_ratio_min   # TODO: original version - fixed min mask_ratio
             mask_ratio_mu = min(mask_ratio_mu, self.args.mask_ratio_mu)
-            mask_ratio_min = mask_ratio_mu - 0.05   # TODO: dynamic min mask_ratio
+            mask_ratio_min = min(self.args.mask_ratio_min, mask_ratio_mu - 0.05)   # TODO: dynamic min mask_ratio
             self.mask_ratio_generator = get_variable_generator(mask_ratio_mu, self.args.mask_ratio_std, mask_ratio_min, self.args.mask_ratio_max)
         if self.args.mage_shuffle:
             shuffle_ratio = self.args.init_shuffle_ratio_mage + (self.args.max_shuffle_ratio_mage - self.args.init_shuffle_ratio_mage) * (self.global_step / len(self.train_dataloader) / self.args.epochs)
@@ -431,7 +432,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             replace_threshold_list, replace_ratio_list = [], []
             replace_position_ids, replace_indexes = [], []
         input_ids_list, labels_list, attention_mask_list, position_ids_list = [], [], [], []
-        positions_to_replace_list, position_ids_to_predict_list, add_labels_list = [], [], []
+        positions_to_replace_list, position_ids_to_predict_list, add_labels_list, add_label_tags_list = [], [], [], []
         max_add_positions, max_seq_len = 0, 0
         
         ##=== masking & adding noise ===##
@@ -471,6 +472,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             # extract position ids to predict
             position_ids_to_predict = raw_position_ids[mask_label_position_ids]
             add_cur_labels = labels[i][position_ids_to_predict]
+            add_label_tags = torch.ones_like(add_cur_labels)
             
             ##=== replace input ids ===##
             if self.args.reconstruct:
@@ -482,6 +484,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 # update the positions to predict
                 position_ids_to_predict = torch.cat((position_ids_to_predict, cur_position_ids[replace_ids]), dim=-1)
                 add_cur_labels = torch.cat((add_cur_labels, cur_labels[replace_ids]), dim=-1)
+                add_label_tags = torch.cat((add_label_tags, torch.zeros_like(cur_labels[replace_ids])), dim=-1)
                 
                 # #################### sanity check ####################
                 # _cur_input_ids = cur_input_ids.clone()
@@ -514,6 +517,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             positions_to_replace_list.append(torch.tensor(cur_input_ids.size(-1) - 1, device=self.args.device))
             position_ids_to_predict_list.append(position_ids_to_predict)
             add_labels_list.append(add_cur_labels)
+            add_label_tags_list.append(add_label_tags)
         
         ##=== arrange samples with padding ===##
         for i in range(batch_size):
@@ -535,6 +539,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                     position_ids_list[i] = position_ids_list[i][shuffled_ids]
             tmp = torch.ones((pad_len,), dtype=torch.long, device=self.args.device)
             input_ids_list[i] = torch.cat((input_ids_list[i], tmp * self.tokenizer.pad_token_id), dim=-1).long()
+            tag = torch.cat((torch.ones_like(labels_list[i]) * 2, tmp * IGNORE_INDEX), dim=-1).long()
             labels_list[i] = torch.cat((labels_list[i], tmp * IGNORE_INDEX), dim=-1).long()
             position_ids_list[i] = torch.cat((position_ids_list[i], tmp * 0), dim=-1).long()
             
@@ -544,7 +549,9 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             tmp = torch.ones((to_add_len,), dtype=torch.long, device=self.args.device)
             position_ids_to_predict_list[i] = torch.cat((position_ids_to_predict_list[i], tmp * 0), dim=-1).long()
             add_labels_list[i] = torch.cat((add_labels_list[i], tmp * IGNORE_INDEX), dim=-1).long()
+            add_label_tags_list[i] = torch.cat((add_label_tags_list[i], tmp * IGNORE_INDEX), dim=-1).long()
             labels_list[i] = torch.cat((labels_list[i], add_labels_list[i]), dim=-1).long()
+            add_label_tags_list[i] = torch.cat((tag, add_label_tags_list[i]), dim=-1).long()
         
         mask_threshold = torch.stack(mask_threshold_list, dim=0).mean()
         mask_ratio = torch.stack(mask_ratio_list, dim=0).mean()
@@ -582,6 +589,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             'mask_ratio': mask_ratio,
             'replace_threshold': replace_threshold if self.args.reconstruct else torch.zeros_like(mask_threshold),
             'replace_ratio': replace_ratio if self.args.reconstruct else torch.zeros_like(replace_ratio),
+            'add_label_tags': torch.stack(add_label_tags_list, dim=0),
         }
     
     def create_oa_batch(self, batch: SupervisedDataset) -> dict[str, Any]:
@@ -685,6 +693,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         mask_ratio: torch.Tensor | None = None,
         replace_threshold: torch.Tensor | None = None,
         replace_ratio: torch.Tensor | None = None,
+        add_label_tags: torch.LongTensor | None = None,
     ) -> dict[str, Any]:
         """Performs a single training step.
 
@@ -696,7 +705,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         Returns:
             dict[str, Any]: training loss, learning rate
         """
-        loss = self.loss(
+        outputs = self.loss(
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
@@ -707,50 +716,30 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             topk_ids=topk_ids,
             replace_indexes=replace_indexes,
             use_cache=False,
-        )['loss']
+            return_logits=True,
+        )
         
-        # #################### sanity check ####################
-        # outputs: OAModelOutput = self.model(
-        #     input_ids=input_ids,
-        #     attention_mask=attention_mask,
-        #     labels=labels,
-        #     position_ids=position_ids,
-        #     positions_to_replace=positions_to_replace,
-        #     position_ids_to_predict=position_ids_to_predict,
-        #     topk_probs=topk_probs,
-        #     topk_ids=topk_ids,
-        #     replace_indexes=replace_indexes,
-        #     use_cache=False
-        # )
-        # 
-        # logits = outputs['logits'].detach()
-        # idx = 0
-        # 
-        # _position_ids = position_ids.clone()
-        # _labels = labels.clone()
-        # _input_ids = input_ids.clone()
-        # text = self.tokenizer.decode([
-        #     _input_ids[idx][_position_ids[idx].tolist().index(x)].item() if x in _position_ids[idx] else 583 
-        #     for x in range(_position_ids[idx].min().item(), _position_ids[idx].max().item() + 1)
-        # ])
-        # 
-        # orig_len = _position_ids.size(-1)
-        # shift_logits = torch.cat((logits[..., :orig_len-1, :].contiguous(), logits[..., orig_len:, :].contiguous()), dim=1)
-        # shift_labels = _labels[..., 1:].contiguous()
-        # shift_logits = shift_logits.view(-1, self.model.module.config.vocab_size)
-        # shift_labels = shift_labels.view(-1).to(shift_logits.device)
-        # loss_fct = CrossEntropyLoss(reduction='none')
-        # _loss = loss_fct(shift_logits, shift_labels).view(_input_ids.size(0), -1)
-        # 
-        # selected_ids = _labels[idx][_input_ids.size(-1):].ge(0).nonzero().squeeze()
-        # losses = _loss[idx][_input_ids.size(-1) - 1:][selected_ids]
-        # special_ids = losses.lt(2).nonzero().squeeze()
-        # tokens = [self.tokenizer.decode([x]) for x in _labels[idx][_input_ids.size(-1):][selected_ids[special_ids]]]
-        # import ipdb; ipdb.set_trace()
-        # ######################################################
+        loss = outputs['loss']
         
         self.model.backward(loss)
         self.model.step()
+        
+        #################### sanity check ####################
+        logits = outputs['logits']
+        
+        orig_len = input_ids.size(-1)
+        shift_logits = torch.cat((logits[..., :orig_len-1, :].contiguous(), logits[..., orig_len:, :].contiguous()), dim=1)
+        shift_labels = labels[..., 1:].contiguous()
+        shift_logits = shift_logits.view(-1, self.model.module.config.vocab_size)
+        shift_labels = shift_labels.view(-1).to(shift_logits.device)
+        loss_fct = CrossEntropyLoss(reduction='none')
+        losses = loss_fct(shift_logits, shift_labels).view(input_ids.size(0), -1)
+        
+        shift_tags = add_label_tags[..., 1:].contiguous()
+        loss_ar = (losses * shift_tags.eq(2)).sum() / max(1, shift_tags.eq(2).sum())
+        loss_oa = (losses * shift_tags.eq(1)).sum() / max(1, shift_tags.eq(1).sum())
+        loss_dn = (losses * shift_tags.eq(0)).sum() / max(1, shift_tags.eq(0).sum())
+        ######################################################
         
         loss = get_all_reduce_mean(loss)
         mask_threshold = get_all_reduce_mean(mask_threshold)
@@ -758,6 +747,9 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         if self.args.reconstruct:
             replace_threshold = get_all_reduce_mean(replace_threshold)
             replace_ratio = get_all_reduce_mean(replace_ratio)
+        loss_ar = get_all_reduce_mean(loss_ar)
+        loss_oa = get_all_reduce_mean(loss_oa)
+        loss_dn = get_all_reduce_mean(loss_dn)
         
         dist.barrier()
         
@@ -768,4 +760,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             'train/mask_ratio': mask_ratio.item(),
             'train/replace_threshold': replace_threshold.item() if self.args.reconstruct else 0,
             'train/replace_ratio': replace_ratio.item() if self.args.reconstruct else 0,
+            'train/loss_ar': loss_ar.item(),
+            'train/loss_oa': loss_oa.item(),
+            'train/loss_dn': loss_dn.item(),
         }
