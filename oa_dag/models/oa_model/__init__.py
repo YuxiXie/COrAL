@@ -39,7 +39,7 @@ class _LazyAutoMappingInOA(_LazyAutoMapping):
 MODEL_FOR_OA_MAPPING_NAMES: OrderedDict[str, str] = OrderedDict(
     [
         # OA model mapping
-        # ('llama', 'LlamaForOA'),
+        ('llama', 'LlamaForCausalLMOA'),
         ('mistral', 'MistralForCausalLMOA'),
     ],
 )
