@@ -319,7 +319,7 @@ def main() -> None:
 
     trainer = SupervisedFinetuneTrainer(args, ds_config)
     trainer.train()
-    trainer.save()
+    # trainer.save()
 
 
 if __name__ == '__main__':

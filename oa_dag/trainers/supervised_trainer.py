@@ -19,6 +19,7 @@ from __future__ import annotations
 import abc
 import argparse
 from typing import Any, ClassVar
+import re
 
 import deepspeed
 import torch
@@ -207,13 +208,13 @@ class SupervisedTrainer(TrainerBase):
             if steps_trained_in_current_epoch > 0:
                 progress_bar.update(steps_trained_in_current_epoch)
             self.global_step = steps_trained_in_current_epoch
-            epochs_trained = steps_trained_in_current_epoch // len(self.train_dataloader)
-            steps_trained_in_current_epoch %= len(self.train_dataloader)
             if not steps_trained_in_current_epoch:
-                _step = int(self.args.resume_from_ckpt.split('/')[-1].replace('steps', ''))
+                _step = int(re.search(r'\b\d+\b', self.args.resume_from_ckpt)[0])
                 steps_trained_in_current_epoch = _step
                 progress_bar.update(steps_trained_in_current_epoch)
                 self.global_step = steps_trained_in_current_epoch
+            epochs_trained = steps_trained_in_current_epoch // len(self.train_dataloader)
+            steps_trained_in_current_epoch %= len(self.train_dataloader)
 
         if self.args.need_eval:
             self.logger.print('\n***** Evaluating at the beginning *****')
