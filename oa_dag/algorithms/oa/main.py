@@ -361,6 +361,11 @@ def parse_arguments() -> argparse.Namespace:
         default=1.0,
     )
     evaluation_parser.add_argument(
+        '--eval_replace_ratio',
+        type=float,
+        default=0.0,
+    )
+    evaluation_parser.add_argument(
         '--eval_split_ratio',
         type=float,
         default=None,

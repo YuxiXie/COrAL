@@ -740,6 +740,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
             attention_mask = input_ids.new_ones(input_ids.size(), dtype=torch.bool)
         
         raw_input_ids = input_ids.clone().detach()
+        raw_position_ids = torch.arange(0, raw_input_ids.size(-1), dtype=torch.long, device=input_ids.device).unsqueeze(0)
         tracks = []
         keep_generate, accumulated_n_tokens = True, 0
         topk_probs, topk_ids, replace_indexes = None, None, None
@@ -767,18 +768,21 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
             
             if denoising:
                 results = torch.topk(nn.functional.softmax(logits, dim=-1), k=topk, dim=-1)
-                topk_probs, topk_ids = results.values[:, :accumulated_n_tokens, :], results.indices[:, :accumulated_n_tokens, :]
-                if position_ids_to_predict[:, :accumulated_n_tokens].max() + 1 > input_ids.size(-1):
-                    replace_indexes = position_ids_to_predict[:, :accumulated_n_tokens]
-                    input_ids = pad_tensors(input_ids, max_len=position_ids_to_predict[:, :accumulated_n_tokens].max() + 1, pad_value=tokenizer.pad_token_id)
-                    attention_mask = pad_tensors(attention_mask, max_len=position_ids_to_predict[:, :accumulated_n_tokens].max() + 1, pad_value=True).bool()
-                    position_ids = None     # torch.cat((position_ids, replace_indexes), dim=-1)
-                    positions_to_replace = (position_ids_to_predict[:, :accumulated_n_tokens].max(dim=-1).values + 1).long().unsqueeze(-1)
-                input_ids[0][replace_indexes[0]] = torch.multinomial(probs[:accumulated_n_tokens, ...], num_samples=1).squeeze(1)
+                _, sorted_indexes = torch.sort(results.values.max(dim=-1).values[0], dim=-1, descending=True)
+                indexes_to_keep = sorted_indexes[:accumulated_n_tokens].sort().values
+                topk_probs, topk_ids = results.values[:, indexes_to_keep, :], results.indices[:, indexes_to_keep, :]
+                if position_ids_to_predict[:, indexes_to_keep].max() + 1 > input_ids.size(-1):
+                    replace_indexes = position_ids_to_predict[:, indexes_to_keep]
+                    input_ids = pad_tensors(input_ids, max_len=raw_input_ids.size(-1) + replace_indexes.size(-1), pad_value=tokenizer.pad_token_id)
+                    attention_mask = pad_tensors(attention_mask, max_len=raw_input_ids.size(-1) + replace_indexes.size(-1), pad_value=True).bool()
+                    position_ids = torch.cat((raw_position_ids, replace_indexes), dim=-1)
+                    positions_to_replace = torch.tensor([raw_input_ids.size(-1) + replace_indexes.size(-1)]).long().unsqueeze(-1)
+                input_ids[0][raw_input_ids.size(-1):] = torch.multinomial(probs[indexes_to_keep, ...], num_samples=1).squeeze(1)
                 tracks.append([
-                    input_ids[0][replace_indexes[0]].clone().tolist(),
+                    input_ids[0][raw_input_ids.size(-1):].clone().tolist(),
                     replace_indexes[0].clone().tolist()
                 ])
+                replace_indexes = position_ids_to_predict[:, :accumulated_n_tokens]
             else:
                 # sample and get candidate tokens
                 tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
@@ -851,11 +855,15 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
                 positions_to_replace = torch.stack(new_positions_to_replace_list, dim=0)
                 if not denoising:
                     position_ids_to_predict = torch.stack(new_position_ids_to_predict_list, dim=0)
-                
+            
             print(tokenizer.decode(input_ids[0]))
-            if '</s>' in tokenizer.decode(input_ids[0]) and '\n#### ' in tokenizer.decode(input_ids[0]): break
-            if accumulated_n_tokens > position_ids_to_predict.max().item() + 5: break
-            # import ipdb; ipdb.set_trace()
-        # import ipdb; ipdb.set_trace()
+            if position_ids.max() == position_ids.size(-1) - 1 and position_ids_to_predict.max() == position_ids.max():
+                if '</s>' in tokenizer.decode(input_ids[0]) and '\n#### ' in tokenizer.decode(input_ids[0]):
+                    if accumulated_n_tokens > position_ids_to_predict.max().item() * 2: break
+                else:
+                    tmp = torch.arange(position_ids_to_predict.max() + 1, min(position_ids_to_predict.max() + 11, max_length), dtype=torch.long, device=input_ids.device).unsqueeze(0)
+                    position_ids_to_predict = torch.cat((position_ids_to_predict, tmp), dim=-1)
+            if accumulated_n_tokens > position_ids_to_predict.max().item() * 2: break
         
+        # import ipdb; ipdb.set_trace()
         return tracks, input_ids

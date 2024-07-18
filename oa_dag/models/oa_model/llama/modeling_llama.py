@@ -12,7 +12,10 @@ from transformers import LlamaPreTrainedModel, PreTrainedTokenizerBase
 from transformers.models.llama.modeling_llama import (
     LlamaConfig, LlamaAttention, LlamaRMSNorm, LlamaMLP,
     _CONFIG_FOR_DOC, LLAMA_INPUTS_DOCSTRING, 
-    rotate_half, apply_rotary_pos_emb, repeat_kv, _prepare_4d_causal_attention_mask_for_sdpa, 
+    rotate_half, apply_rotary_pos_emb, repeat_kv,
+)
+from transformers.modeling_attn_mask_utils import (
+    _prepare_4d_causal_attention_mask_for_sdpa, 
     _prepare_4d_causal_attention_mask,
 )
 from transformers.generation.utils import LogitsProcessorList, TemperatureLogitsWarper, TopKLogitsWarper, TopPLogitsWarper

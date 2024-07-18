@@ -17,14 +17,16 @@
 from __future__ import annotations
 
 from typing import Any
+from tqdm import tqdm
 
 import torch
 from transformers import AutoModelForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast
+import torch.distributed as dist
 
-from oa_dag.datasets import SupervisedDataset
+from oa_dag.datasets import SupervisedDataset, PromptOnlyDataset
 from oa_dag.trainers import SupervisedTrainer
-from oa_dag.utils import get_all_reduce_mean
+from oa_dag.utils import get_all_reduce_mean, is_main_process, to_device
 
 
 class SupervisedFinetuneTrainer(SupervisedTrainer):
@@ -32,7 +34,49 @@ class SupervisedFinetuneTrainer(SupervisedTrainer):
 
     TRAINING_TYPE = 'sft'
     DATASET_TYPE = SupervisedDataset
+    EVAL_DATA_TYPE = PromptOnlyDataset
     MODEL_TYPE = AutoModelForCausalLM
+    
+    def eval(self) -> dict[str, Any]:
+        """Evaluate the model on the evaluation dataset."""
+        if self.eval_dataloader is None:
+            return {}
+
+        self.set_eval()
+        prompts: list[str] = []
+        generateds: list[str] = []
+
+        eval_dataloader = tqdm(
+            self.eval_dataloader,
+            desc='Evaluating',
+            disable=not is_main_process(),
+        )
+
+        cnt = 0
+        for batch in eval_dataloader:
+            cnt += 1
+            batch = to_device(batch, self.args.device)
+            with torch.no_grad():
+                seq = self.model.module.generate(
+                    input_ids=batch['input_ids'],
+                    attention_mask=batch['attention_mask'],
+                    max_length=self.args.max_length,
+                    synced_gpus=True,
+                    do_sample=False,
+                )
+
+            dist.barrier()
+
+            prompt = self.tokenizer.batch_decode(batch['input_ids'], skip_special_tokens=True)
+            generated = self.tokenizer.batch_decode(seq, skip_special_tokens=True)
+            generated = [text[len(prompt[i]) :] for i, text in enumerate(generated)]
+            prompts.extend(prompt)
+            generateds.extend(generated)
+            # import ipdb; ipdb.set_trace()
+            if cnt > 100: break
+        dist.barrier()
+        
+        import ipdb; ipdb.set_trace()
     
     def loss(
         self,
