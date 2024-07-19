@@ -27,6 +27,7 @@ from typing import Any, Callable, Generator, TypeVar, cast
 from typing_extensions import TypeAlias  # Python 3.10+
 import scipy.stats as stats
 
+import math
 import numpy as np
 import optree
 import torch
@@ -340,7 +341,7 @@ def shuffle_and_mask(label_position_ids: torch.LongTensor, ratio_generator, left
         if fixed_mask_threshold >= 0:
             mask_threshold = fixed_mask_threshold
         else:
-            # sample to get masking threshold                    
+            # sample to get masking threshold
             mask_threshold = ratio_generator.rvs(1)[0]
             
         if left2right:  # mask the right part
@@ -384,4 +385,62 @@ def add_noise(cur_input_ids: torch.LongTensor, cur_labels: torch.LongTensor, rat
         new_replace_ids = replace_ids[random_noise.lt(replace_with_prob).nonzero().squeeze(-1)]
     
     return replace_ids, new_replace_ids, replace_threshold
+
+
+def decode_masked_text(input_ids: torch.LongTensor, position_ids: torch.LongTensor, replace_indexes: torch.LongTensor, tokenizer, topk_ids: torch.LongTensor = None):
+    if topk_ids is not None:
+        _replace_indexes = replace_indexes[replace_indexes.ge(0).nonzero().squeeze(-1)]
+        input_ids[_replace_indexes] = topk_ids[:_replace_indexes.size(-1), 0]
+    special_id = tokenizer.encode('_')[-1]
+    ids = [input_ids[position_ids.tolist().index(x)] if x in position_ids else special_id for x in range(position_ids.min().item(), position_ids.max().item() + 1)]
+    text = tokenizer.decode(ids)
+    return text
+
+
+def corrupt_input(replace_ids: torch.LongTensor, input_ids: torch.LongTensor, raw_input_ids: torch.LongTensor, position_ids: torch.LongTensor, labels: torch.LongTensor, 
+                  raw_labels: torch.LongTensor, tokenizer, insert_ratio: float=0.0, max_length: int=512, max_repeat_times: int=5, device=None):
+    # random tokens
+    random_ids = torch.randint(tokenizer.vocab_size, replace_ids.size(), device=device)    
+    # shifted results
+    left_shifted_position_ids, right_shifted_position_ids = position_ids[replace_ids] - 1, position_ids[replace_ids] + 1
+    if right_shifted_position_ids.max() >= raw_input_ids.size(-1):
+        right_shifted_position_ids[right_shifted_position_ids.eq(right_shifted_position_ids.max()).nonzero().squeeze(-1)] = 0
+    left_shifted_ids, right_shifted_ids = raw_input_ids[left_shifted_position_ids], raw_input_ids[right_shifted_position_ids]
     
+    k = min(int(insert_ratio * (replace_ids.size(-1) - 1)), max_length - input_ids.size(-1))
+    max_repeat_times = min(int((max_length - input_ids.size(-1)) // max(1, k)), max_repeat_times)
+    if k > 0:
+        # insert tokens
+        perm = torch.randperm(replace_ids.size(-1) - 1, device=device)[:k]
+        insert_ids = replace_ids[perm.sort(descending=True).values]
+        generator = stats.truncnorm(-.5, max_repeat_times - .5, loc=0.5, scale=1)
+        for _id in insert_ids:
+            repeat_cnt = math.ceil(generator.rvs(1)[0])
+            input_ids = torch.cat((input_ids[:_id + 1], input_ids[_id:_id + 1].repeat(repeat_cnt), input_ids[_id + 1:]), dim=-1)
+            position_ids = torch.cat((position_ids[:_id + 1], torch.arange(1, repeat_cnt + 1, dtype=torch.long, device=device) + position_ids[_id].item(), 
+                                      position_ids[_id + 1:-1] + repeat_cnt, position_ids[-1:]), dim=-1)
+        existing_position_ids = position_ids[position_ids.lt(raw_input_ids.size(-1)).nonzero().squeeze(-1)]
+        addional_position_ids = position_ids[position_ids.ge(raw_input_ids.size(-1)).nonzero().squeeze(-1)]
+        if addional_position_ids.size(-1) > 0:
+            labels = torch.cat((raw_labels[existing_position_ids], torch.tensor([tokenizer.eos_token_id] * addional_position_ids.size(-1), dtype=torch.long, device=device)), dim=-1)
+        else:
+            labels = raw_labels[position_ids]
+    else:
+        for idx in range(replace_ids.size(-1)):
+            _id = replace_ids[idx]
+            var = random.random()
+            if var < .05:
+                # random tokens
+                input_ids[_id] = random_ids[idx]
+            elif var < .15:
+                # random tokens in the context
+                input_ids[_id] = raw_input_ids[random.randint(0, raw_input_ids.size(-1) - 1)]
+            else:
+                # neighboring tokens
+                var = random.random()
+                if var < .5:
+                    input_ids[_id] = left_shifted_ids[idx]
+                else:
+                    input_ids[_id] = right_shifted_ids[idx]
+
+    return input_ids, position_ids, labels

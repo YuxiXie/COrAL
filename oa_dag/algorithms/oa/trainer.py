@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import random
 from argparse import Namespace
 from typing import Any
 from tqdm import tqdm
@@ -22,6 +23,7 @@ from oa_dag.utils import (
     get_variable_generator, pad_tensors, 
     get_all_reduce_mean, get_all_reduce_min,
     is_main_process, to_device, 
+    decode_masked_text, corrupt_input,
     json_dump,
 )
 
@@ -293,8 +295,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         for i in range(batch_size):
             replace_ids = replace_position_ids[i]            
             cur_input_ids = input_ids[i][attention_mask[i].nonzero().squeeze(dim=-1)].clone()
-            corrupt_ids, _ = shuffle_and_mask(labels[i].ne(IGNORE_INDEX).nonzero().squeeze(), self.mask_ratio_generator,
-                                              device=self.args.device)
+            corrupt_ids, _ = shuffle_and_mask(labels[i].ne(IGNORE_INDEX).nonzero().squeeze(), self.mask_ratio_generator, device=self.args.device)
             cur_input_ids[corrupt_ids] = IGNORE_INDEX
             selected_indexes = cur_input_ids.ne(IGNORE_INDEX).nonzero().squeeze(dim=-1)
             cur_input_ids = cur_input_ids[selected_indexes]
@@ -376,6 +377,12 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         input_ids_list, labels_list, attention_mask_list, position_ids_list = [], [], [], []
         positions_to_replace_list, position_ids_to_predict_list, add_labels_list, add_label_tags_list = [], [], [], []
         max_add_positions, max_seq_len = 0, 0
+        insert_cnt, replace_cnt, self_replace_cnt = 0, 0, 0
+        
+        to_insert = torch.rand(1, device=self.args.device).mean()
+        to_insert = get_all_reduce_mean(to_insert)
+        dist.barrier()
+        to_insert = to_insert.lt(.5).item() if self.args.insert_with_prob > 0 else False
         
         ##=== masking & adding noise ===##
         for i in range(batch_size):
@@ -412,7 +419,6 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             
             ##=== rearrange unmasked tokens to get labels ===##
             cur_labels = labels[i][cur_position_ids]
-            max_seq_len = max(cur_labels.size(-1), max_seq_len)
             # extract position ids to predict
             position_ids_to_predict = raw_position_ids[mask_label_position_ids]
             add_cur_labels = labels[i][position_ids_to_predict]
@@ -431,28 +437,22 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 add_cur_labels = torch.cat((add_cur_labels, cur_labels[replace_ids]), dim=-1)
                 add_label_tags = torch.cat((add_label_tags, torch.zeros_like(cur_labels[replace_ids])), dim=-1)
                 
-                # #################### sanity check ####################
-                # _cur_input_ids = cur_input_ids.clone()
-                # text = self.tokenizer.decode([_cur_input_ids[cur_position_ids.eq(idx).nonzero()[0].item()].item() if idx in cur_position_ids else 583 for idx in range(cur_position_ids.min().item(), cur_position_ids.max().item() + 1)])
-                # _cur_input_ids[new_replace_ids] = torch.randint(self.tokenizer.vocab_size, _cur_input_ids[new_replace_ids].size(), device=self.args.device)
-                # text1 = self.tokenizer.decode([_cur_input_ids[cur_position_ids.eq(idx).nonzero()[0].item()].item() if idx in cur_position_ids else 583 for idx in range(cur_position_ids.min().item(), cur_position_ids.max().item() + 1)])
-                # _cur_input_ids[replace_ids] = torch.randint(self.tokenizer.vocab_size, _cur_input_ids[replace_ids].size(), device=self.args.device)
-                # text2 = self.tokenizer.decode([_cur_input_ids[cur_position_ids.eq(idx).nonzero()[0].item()].item() if idx in cur_position_ids else 583 for idx in range(cur_position_ids.min().item(), cur_position_ids.max().item() + 1)])
-                # import ipdb; ipdb.set_trace()
-                # ######################################################
-                
                 # replace input ids
-                if self.args.replace_with_prob < 1:
-                    if cur_labels.ne(IGNORE_INDEX).any().item():
-                        cur_input_ids[new_replace_ids] = torch.randint(self.tokenizer.vocab_size, cur_input_ids[new_replace_ids].size(), device=self.args.device)
-                    replace_indexes.append(new_replace_ids)
-                    replace_position_ids.append(cur_position_ids[new_replace_ids])
-                else:
-                    if cur_labels.ne(IGNORE_INDEX).any().item():
-                        cur_input_ids[replace_ids] = torch.randint(self.tokenizer.vocab_size, cur_input_ids[replace_ids].size(), device=self.args.device)
-                    replace_indexes.append(replace_ids)
-                    replace_position_ids.append(cur_position_ids[replace_ids])
-                    
+                cur_replace_ids = new_replace_ids if self.args.replace_with_prob < 1 else replace_ids
+                replace_indexes.append(cur_replace_ids)
+                replace_position_ids.append(cur_position_ids[cur_replace_ids])
+                if cur_replace_ids.size(-1) > 0 and cur_labels.ne(IGNORE_INDEX).any().item():
+                    if to_insert and random.random() < self.args.insert_with_prob:
+                        insert_cnt += 1
+                        cur_input_ids, cur_position_ids, cur_labels = corrupt_input(cur_replace_ids, cur_input_ids, input_ids[i], cur_position_ids, cur_labels, labels[i], 
+                                                                                    self.tokenizer, insert_ratio=self.args.insert_with_prob, max_length=self.args.max_length, 
+                                                                                    device=self.args.device)
+                    else:
+                        replace_cnt += 1
+                        cur_input_ids, cur_position_ids, cur_labels = corrupt_input(cur_replace_ids, cur_input_ids, input_ids[i], cur_position_ids, cur_labels, labels[i], 
+                                                                                    self.tokenizer, max_length=self.args.max_length, device=self.args.device)
+            
+            max_seq_len = max(cur_labels.size(-1), max_seq_len)
             max_add_positions = max(max_add_positions, position_ids_to_predict.size(-1))
             
             input_ids_list.append(cur_input_ids)
@@ -504,6 +504,8 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             replace_threshold = torch.stack(replace_threshold_list, dim=0).mean()
             replace_ratio = torch.stack(replace_ratio_list, dim=0).mean()
             replace_count_min = torch.stack([torch.tensor(x.size(0), dtype=torch.long, device=self.args.device) for x in replace_indexes], dim=0).min()
+            if insert_cnt > 0:
+                replace_count_min = replace_count_min * 0
             replace_count_min = get_all_reduce_min(replace_count_min)
         dist.barrier()
         
@@ -518,6 +520,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 topk=topk,
             )
             replace_indexes = pad_tensors(replace_indexes, pad_value=-1)
+            replace_cnt, self_replace_cnt = 0, batch_size
         
         return {
             'input_ids': torch.stack(input_ids_list, dim=0),
@@ -534,6 +537,9 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             'replace_threshold': replace_threshold if self.args.reconstruct else torch.zeros_like(mask_threshold),
             'replace_ratio': replace_ratio if self.args.reconstruct else torch.zeros_like(mask_ratio),
             'add_label_tags': torch.stack(add_label_tags_list, dim=0),
+            'insert_part': torch.tensor(insert_cnt / batch_size, dtype=torch.float, device=self.args.device),
+            'replace_part': torch.tensor(replace_cnt / batch_size, dtype=torch.float, device=self.args.device),
+            'self_replace_part': torch.tensor(self_replace_cnt / batch_size, dtype=torch.float, device=self.args.device),
         }
     
     def create_oa_batch(self, batch: SupervisedDataset) -> dict[str, Any]:
@@ -638,6 +644,9 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         replace_threshold: torch.Tensor | None = None,
         replace_ratio: torch.Tensor | None = None,
         add_label_tags: torch.LongTensor | None = None,
+        insert_part: torch.LongTensor | None = None,
+        replace_part: torch.LongTensor | None = None,
+        self_replace_part: torch.LongTensor | None = None,
     ) -> dict[str, Any]:
         """Performs a single training step.
 
@@ -668,7 +677,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         self.model.backward(loss)
         self.model.step()
         
-        #################### sanity check ####################
+        ############################## sanity check ##############################
         logits = outputs['logits']
         
         orig_len = input_ids.size(-1)
@@ -683,7 +692,11 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         loss_ar = (losses * shift_tags.eq(2)).sum() / max(1, shift_tags.eq(2).sum())
         loss_oa = (losses * shift_tags.eq(1)).sum() / max(1, shift_tags.eq(1).sum())
         loss_dn = (losses * shift_tags.eq(0)).sum() / max(1, shift_tags.eq(0).sum())
-        ######################################################
+        
+        # idx = 0
+        # text = decode_masked_text(input_ids[idx], position_ids[idx], replace_indexes[idx], self.tokenizer, topk_ids=topk_ids[idx] if topk_ids is not None else None)
+        # import ipdb; ipdb.set_trace()
+        ##########################################################################
         
         loss = get_all_reduce_mean(loss)
         mask_threshold = get_all_reduce_mean(mask_threshold)
@@ -694,6 +707,10 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         loss_ar = get_all_reduce_mean(loss_ar)
         loss_oa = get_all_reduce_mean(loss_oa)
         loss_dn = get_all_reduce_mean(loss_dn)
+        
+        insert_part = get_all_reduce_mean(insert_part)
+        replace_part = get_all_reduce_mean(replace_part)
+        self_replace_part = get_all_reduce_mean(self_replace_part)
         
         dist.barrier()
         
@@ -707,4 +724,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             'train/loss_ar': loss_ar.item(),
             'train/loss_oa': loss_oa.item(),
             'train/loss_dn': loss_dn.item(),
+            'train/insert_part': insert_part.item(),
+            'train/replace_part': replace_part.item(),
+            'train/self_replace_part': self_replace_part.item(),
         }

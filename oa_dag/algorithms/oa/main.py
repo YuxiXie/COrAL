@@ -94,6 +94,11 @@ def parse_arguments() -> argparse.Namespace:
         action='store_true',
     )
     training_parser.add_argument(
+        '--insert_with_prob',
+        default=0.0,
+        type=float,
+    )
+    training_parser.add_argument(
         '--replace_with_prob',
         type=float,
         default=1.0,

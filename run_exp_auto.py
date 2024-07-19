@@ -37,10 +37,14 @@ if __name__ == "__main__":
     while True:
         free_memory = get_free_gpu_memory()
         sorted_memory = sorted(enumerate(free_memory), key=lambda x:x[1], reverse=True)
-        sorted_memory = [x for x in sorted_memory if x[0] not in [ ]]
+        sorted_memory = [x for x in sorted_memory if x[0] not in [0,4,3,2]]
         
         if sorted_memory[0][1] > MEMORY_THRESHOLD_MB - 1024:
             print("Running on gpu", sorted_memory[0][0])
+            time.sleep(10)
+            free_memory = get_free_gpu_memory()
+            sorted_memory = sorted(enumerate(free_memory), key=lambda x:x[1], reverse=True)
+            sorted_memory = [x for x in sorted_memory if x[0] not in [0,4,3,2]]
             run_experiment([sorted_memory[0][0]])
             # break
         else:
