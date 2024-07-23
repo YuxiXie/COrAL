@@ -343,13 +343,13 @@ def shuffle_and_mask(label_position_ids: torch.LongTensor, ratio_generator, left
         else:
             # sample to get masking threshold
             mask_threshold = ratio_generator.rvs(1)[0]
-            
+        
         if left2right:  # mask the right part
             random_noise = torch.arange(0, label_position_ids.size(-1), dtype=torch.float, device=device)
             random_noise = (-random_noise + label_position_ids.size(-1) - 0.5) / label_position_ids.size(-1)    # reverse to be descending
         else:   # randomly mask
             random_noise = torch.rand(label_position_ids.size(-1), device=device)
-            
+        
         # extract the position ids of the tokens to mask
         mask_label_position_ids = label_position_ids[random_noise.lt(mask_threshold).nonzero().squeeze(-1)]
         if mask_label_position_ids.size(0) > 0 or label_position_ids.size(0) <= 0:
@@ -407,9 +407,17 @@ def corrupt_input(replace_ids: torch.LongTensor, input_ids: torch.LongTensor, ra
         right_shifted_position_ids[right_shifted_position_ids.eq(right_shifted_position_ids.max()).nonzero().squeeze(-1)] = 0
     left_shifted_ids, right_shifted_ids = raw_input_ids[left_shifted_position_ids], raw_input_ids[right_shifted_position_ids]
     
+    start_position_id = raw_labels.ge(0).nonzero().min()
+    end_position_id = position_ids.max()
+    mask_position_ids = [i for i in range(start_position_id.item(), end_position_id.item()) if i not in position_ids]
+    d = min(int(insert_ratio * len(mask_position_ids)), len(mask_position_ids))
+    d = d if d == 0 else random.randint(1, d)
+    mask_position_ids = sorted(random.sample(mask_position_ids, d))
+    
     k = min(int(insert_ratio * (replace_ids.size(-1) - 1)), max_length - input_ids.size(-1))
     max_repeat_times = min(int((max_length - input_ids.size(-1)) // max(1, k)), max_repeat_times)
-    if k > 0:
+    
+    if k > 0 and random.random() <= .5:
         # insert tokens
         perm = torch.randperm(replace_ids.size(-1) - 1, device=device)[:k]
         insert_ids = replace_ids[perm.sort(descending=True).values]
@@ -425,6 +433,10 @@ def corrupt_input(replace_ids: torch.LongTensor, input_ids: torch.LongTensor, ra
             labels = torch.cat((raw_labels[existing_position_ids], torch.tensor([tokenizer.eos_token_id] * addional_position_ids.size(-1), dtype=torch.long, device=device)), dim=-1)
         else:
             labels = raw_labels[position_ids]
+    elif d > 0:
+        for _id in mask_position_ids[::-1]:
+            position_ids[position_ids.gt(_id).nonzero().squeeze(-1)] = position_ids[position_ids.gt(_id).nonzero().squeeze(-1)] - 1
+        labels = raw_labels[position_ids]
     else:
         for idx in range(replace_ids.size(-1)):
             _id = replace_ids[idx]
