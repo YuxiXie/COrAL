@@ -706,33 +706,21 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
         position_ids: torch.LongTensor | None = None,
         positions_to_replace: torch.LongTensor | None = None,
         position_ids_to_predict: torch.LongTensor | None = None,
-        temperature: float = 0.0,
         max_length: int = 512,
-        top_p: float | None = None,
-        top_k: int | None = None,
         tokenizer: PreTrainedTokenizerBase | None = None,
         min_n_tokens: int = 1,
-        max_n_tokens: int = 1,
-        do_sample: bool = False,
-        denoising: bool = False,
         topk: int = 8,
+        token_prob_threshod_to_keep: float = 0.4,
+        low_conf_threshod: float = 0.5,
+        n_add_tokens: int = 10,
+        verbal: bool = False,
     ):
-        assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
-        
-        processors = LogitsProcessorList()
-        warpers = LogitsProcessorList()
-        if temperature != 0.0:
-            warpers.append(TemperatureLogitsWarper(temperature))
-        else:
-            top_k = 1
-        if top_k is not None and top_k > 0:
-            warpers.append(TopKLogitsWarper(top_k=top_k, min_tokens_to_keep=1))
-        if top_p is not None and 0.0 < top_p < 1.0:
-            warpers.append(TopPLogitsWarper(top_p=top_p, min_tokens_to_keep=1))
+        assert input_ids.shape[0] == 1, "Only support batch size 1 for now !!!"
         
         if positions_to_replace is None:
             positions_to_replace = torch.tensor([[input_ids.size(-1)]], dtype=torch.long, device=input_ids.device)
         if position_ids_to_predict is None:
+            assert max_length > input_ids.size(-1), "Input sequence length exceeds maximum length !!!"
             position_ids_to_predict = torch.arange(
                 input_ids.size(-1), max_length, dtype=torch.long, device=input_ids.device
             ).unsqueeze(0)
@@ -741,129 +729,74 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
         
         raw_input_ids = input_ids.clone().detach()
         raw_position_ids = torch.arange(0, raw_input_ids.size(-1), dtype=torch.long, device=input_ids.device).unsqueeze(0)
+        raw_attention_mask = attention_mask.clone().detach()
         tracks = []
-        keep_generate, accumulated_n_tokens = True, 0
+        keep_generate = True
         topk_probs, topk_ids, replace_indexes = None, None, None
+        cnt = 0
         while keep_generate:
+            cnt += 1
             # forward pass to get tokens at position_ids_to_predict
-            n_tokens_to_keep = min(max(min_n_tokens, accumulated_n_tokens), position_ids_to_predict.size(-1), max_n_tokens)
-            accumulated_n_tokens += n_tokens_to_keep
             logits = self(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                position_ids=position_ids, 
-                positions_to_replace=positions_to_replace,
-                position_ids_to_predict=position_ids_to_predict,
-                topk_probs=topk_probs,
-                topk_ids=topk_ids,
-                replace_indexes=replace_indexes,
+                input_ids=input_ids,    # (B, L)
+                attention_mask=attention_mask,    # (B, L)
+                position_ids=position_ids,    # (B, L)
+                positions_to_replace=positions_to_replace,    # (B, 1)
+                position_ids_to_predict=position_ids_to_predict,    # (B, N)
+                topk_probs=topk_probs,    # (B, N, k)
+                topk_ids=topk_ids,    # (B, N, k)
+                replace_indexes=replace_indexes,    # (B, N)
                 return_dict=True,
             ).logits[:, input_ids.size(-1):].contiguous()
-            # topk_labels = torch.topk(logits, k=10, dim=-1).indices
             
-            # extract scores from logits
-            token_scores = processors(input_ids, logits.view(-1, logits.size(-1)))
-            token_scores = warpers(input_ids, token_scores)
-            probs = nn.functional.softmax(token_scores, dim=-1)
+            # extract topk predictions at each position
+            results = torch.topk(nn.functional.softmax(logits, dim=-1), k=topk, dim=-1)
+            # keep tokens where prob >= threshold
+            top_token_probs = results.values[0, :, 0]    # (N,)
+            indexes_to_keep = top_token_probs.ge(token_prob_threshod_to_keep).nonzero().squeeze(-1)    # (N,)
+            kept_n_tokens = indexes_to_keep.size(-1)
             
-            if denoising:
-                results = torch.topk(nn.functional.softmax(logits, dim=-1), k=topk, dim=-1)
-                _, sorted_indexes = torch.sort(results.values.max(dim=-1).values[0], dim=-1, descending=True)
-                indexes_to_keep = sorted_indexes[:accumulated_n_tokens].sort().values
-                topk_probs, topk_ids = results.values[:, indexes_to_keep, :], results.indices[:, indexes_to_keep, :]
-                if position_ids_to_predict[:, indexes_to_keep].max() + 1 > input_ids.size(-1):
-                    replace_indexes = position_ids_to_predict[:, indexes_to_keep]
-                    input_ids = pad_tensors(input_ids, max_len=raw_input_ids.size(-1) + replace_indexes.size(-1), pad_value=tokenizer.pad_token_id)
-                    attention_mask = pad_tensors(attention_mask, max_len=raw_input_ids.size(-1) + replace_indexes.size(-1), pad_value=True).bool()
-                    position_ids = torch.cat((raw_position_ids, replace_indexes), dim=-1)
-                    positions_to_replace = torch.tensor([raw_input_ids.size(-1) + replace_indexes.size(-1)]).long().unsqueeze(-1)
-                input_ids[0][raw_input_ids.size(-1):] = torch.multinomial(probs[indexes_to_keep, ...], num_samples=1).squeeze(1)
-                tracks.append([
-                    input_ids[0][raw_input_ids.size(-1):].clone().tolist(),
-                    replace_indexes[0].clone().tolist()
-                ])
-                replace_indexes = position_ids_to_predict[:, :accumulated_n_tokens]
-            else:
-                # sample and get candidate tokens
-                tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-                try:
-                    scores = torch.stack([probs[idx, tokens[idx]] for idx in range(tokens.size(0))], dim=0)
-                except:
-                    import ipdb; ipdb.set_trace()
-                tokens = tokens.view(input_ids.size(0), -1)
-                scores = scores.view(input_ids.size(0), -1)
-                # keep tokens with the highest scores
-                scores[position_ids_to_predict.eq(0)] = -math.inf
-                _, sorted_ids = torch.sort(scores, dim=-1, descending=True)
-                ############### TODO: keep strategy ###############
-                n = accumulated_n_tokens if denoising else n_tokens_to_keep
-                if not do_sample:
-                    tokens_to_keep = sorted_ids[:, :n]
-                else:
-                    tokens_to_keep = sorted_ids[:, :int(n * 2)]
-                    random_noise = torch.rand_like(tokens_to_keep, dtype=torch.float)
-                    _, sorted_ids = torch.sort(random_noise, dim=-1)
-                    tokens_to_keep = torch.stack([tokens_to_keep[bid][sorted_ids[bid, :n]] for bid in range(sorted_ids.size(0))], dim=0)
-                ###################################################
-                
-                new_input_ids_list = []
-                new_position_ids_list = []
-                new_positions_to_replace_list = []
-                new_position_ids_to_predict_list = []
-                new_max_length = 0
-                cur_step = []
-                for bid in range(input_ids.size(0)):
-                    # append the tokens to keep
-                    if denoising:
-                        cur_input_ids = raw_input_ids[bid][raw_input_ids[bid].ne(tokenizer.pad_token_id).nonzero().squeeze(dim=-1)]
-                        cur_position_ids = position_ids[bid][raw_input_ids[bid].ne(tokenizer.pad_token_id).nonzero().squeeze(dim=-1)]
-                    else:
-                        cur_input_ids = input_ids[bid][attention_mask[bid].nonzero().squeeze(dim=-1)]
-                        cur_position_ids = position_ids[bid][attention_mask[bid].nonzero().squeeze(dim=-1)]
-                    add_input_ids = tokens[bid][tokens_to_keep[bid]]
-                    add_position_ids = position_ids_to_predict[bid][tokens_to_keep[bid]]
-                    new_input_ids = torch.cat((cur_input_ids, add_input_ids), dim=-1)
-                    new_position_ids = torch.cat((cur_position_ids, add_position_ids), dim=-1)
-                    # sort the inputs into the ascending order
-                    _, tmp_idx = new_position_ids.sort()
-                    new_input_ids = new_input_ids[tmp_idx]
-                    new_position_ids = new_position_ids[tmp_idx]
-                    cur_step.append([new_input_ids[raw_input_ids[bid].ne(tokenizer.pad_token_id).sum():].tolist(), 
-                                    new_position_ids[raw_input_ids[bid].ne(tokenizer.pad_token_id).sum():].tolist()])
-                    # update the positions to predict
-                    new_position_ids_to_predict = [x for x in position_ids_to_predict[bid] if x not in add_position_ids]
-                    if sum(new_position_ids_to_predict) <= 0: continue
-                    new_position_ids_to_predict = torch.stack(new_position_ids_to_predict, dim=0)
-                    
-                    new_input_ids_list.append(new_input_ids)
-                    new_position_ids_list.append(new_position_ids)
-                    new_positions_to_replace_list.append(torch.tensor(new_input_ids.size(-1), dtype=torch.long, device=new_input_ids.device).unsqueeze(-1))
-                    new_position_ids_to_predict_list.append(new_position_ids_to_predict)
-                    new_max_length = max(new_max_length, new_input_ids.size(-1))
-                for bid in range(len(new_input_ids_list)):
-                    pad_len = new_max_length - new_input_ids_list[bid].size(-1)
-                    tmp = torch.ones((pad_len,), dtype=torch.long, device=new_input_ids_list[bid].device)
-                    new_input_ids_list[bid] = torch.cat((new_input_ids_list[bid], tmp * tokenizer.pad_token_id), dim=-1).long()
-                    new_position_ids_list[bid] = torch.cat((new_position_ids_list[bid], tmp * 0), dim=-1).long()
-                
-                tracks.append(cur_step[0])
-                if len(new_input_ids_list) <= 0: break
-                
-                input_ids = torch.stack(new_input_ids_list, dim=0)
-                attention_mask = input_ids.ne(tokenizer.pad_token_id)
-                position_ids = torch.stack(new_position_ids_list, dim=0)
-                positions_to_replace = torch.stack(new_positions_to_replace_list, dim=0)
-                if not denoising:
-                    position_ids_to_predict = torch.stack(new_position_ids_to_predict_list, dim=0)
+            # select predicted tokens to keep
+            min_accumulated_n_tokens = min((input_ids.size(-1) - raw_input_ids.size(-1)) + min_n_tokens, position_ids_to_predict.size(-1))
+            if kept_n_tokens < min_accumulated_n_tokens:
+                _, sorted_indexes = torch.sort(top_token_probs, dim=-1, descending=True)    # (N,)
+                indexes_to_keep = sorted_indexes[:min_accumulated_n_tokens].sort().values    # (n,)
+                kept_n_tokens = indexes_to_keep.size(-1)
+            topk_probs, topk_ids = results.values[:, indexes_to_keep, :], results.indices[:, indexes_to_keep, :]    # (B, N, k)
             
-            print(tokenizer.decode(input_ids[0]))
-            if position_ids.max() == position_ids.size(-1) - 1 and position_ids_to_predict.max() == position_ids.max():
-                if '</s>' in tokenizer.decode(input_ids[0]) and '\n#### ' in tokenizer.decode(input_ids[0]):
-                    if accumulated_n_tokens > position_ids_to_predict.max().item() * 2: break
-                else:
-                    tmp = torch.arange(position_ids_to_predict.max() + 1, min(position_ids_to_predict.max() + 11, max_length), dtype=torch.long, device=input_ids.device).unsqueeze(0)
-                    position_ids_to_predict = torch.cat((position_ids_to_predict, tmp), dim=-1)
-            if accumulated_n_tokens > position_ids_to_predict.max().item() * 2: break
+            # update inputs for next iteration
+            input_ids = pad_tensors(raw_input_ids, max_len=(raw_input_ids.size(-1) + kept_n_tokens), pad_value=tokenizer.pad_token_id)  # (B, L)
+            input_ids[0, raw_input_ids.size(-1):] = topk_ids[0, :, 0]
+            attention_mask = pad_tensors(raw_attention_mask, max_len=(raw_input_ids.size(-1) + kept_n_tokens), pad_value=True).bool()  # (B, L)
+            position_ids = torch.cat((raw_position_ids, position_ids_to_predict[:, indexes_to_keep]), dim=-1)  # (B, L)
+            positions_to_replace = torch.tensor([raw_input_ids.size(-1) + kept_n_tokens]).long().unsqueeze(-1)  # (B, 1)
+            replace_indexes = position_ids_to_predict[:, :kept_n_tokens]  # (B, N)
+            # track the updates
+            tracks.append([
+                input_ids[0, raw_input_ids.size(-1):].clone().tolist(),
+                position_ids_to_predict[0, indexes_to_keep].clone().tolist(),
+            ])
+            
+            if verbal:
+                print(tokenizer.decode(input_ids[0]))
+            
+            # check whether reached eos
+            eos_index = input_ids[0].eq(tokenizer.eos_token_id).nonzero()
+            eos_index = eos_index.min() if eos_index.size(0) > 0 else None
+            if eos_index is not None:
+                eos_position_id = position_ids[0, eos_index]
+                # check low-confidence predictions
+                low_conf_indexes = top_token_probs[:eos_position_id - raw_input_ids.size(-1) + 1].lt(low_conf_threshod).nonzero().squeeze(-1)
+                if low_conf_indexes.size(0) <= 0:
+                    break
+                # regenerate on the low-confidence positions
+                # if low_conf_indexes.size(0) < 3:
+                #     import ipdb; ipdb.set_trace()
+            elif top_token_probs.ge(low_conf_threshod).all():
+                tmp = torch.arange(position_ids_to_predict.max() + 1, min(position_ids_to_predict.max() + n_add_tokens + 1, max_length), dtype=torch.long, device=input_ids.device).unsqueeze(0)
+                position_ids_to_predict = torch.cat((position_ids_to_predict, tmp), dim=-1)
+            
+            if cnt > position_ids_to_predict.size(-1):
+                break
         
-        # import ipdb; ipdb.set_trace()
         return tracks, input_ids

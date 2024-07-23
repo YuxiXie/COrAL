@@ -111,14 +111,9 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 position_ids=batch['position_ids'],
                 positions_to_replace=batch['positions_to_replace'],
                 position_ids_to_predict=batch['position_ids_to_predict'],
-                temperature=self.args.temperature,
                 max_length=self.args.max_length,
-                top_k=self.args.top_k,
-                top_p=self.args.top_p,
                 tokenizer=self.tokenizer,
-                max_n_tokens=self.args.max_n_tokens_per_step,
-                do_sample=self.args.do_sample,
-                denoising=self.args.denoising,
+                verbal=self.args.verbal_decoding,
             )
             dist.barrier()            
             return tracks
@@ -194,7 +189,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 text = self.tokenizer.batch_decode(batch['input_ids'], skip_special_tokens=True)
                 texts.extend(text)
                 # import ipdb; ipdb.set_trace()
-                if cnt >= 100: break
+                # if cnt >= 100: break
             else:
                 loss = self.eval_step(**batch)
                 for pid, values in loss.items():
@@ -202,10 +197,11 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                     counts[pid].append(values[1])
 
         if self.args.do_decoding:
-            if self.args.do_sample:
-                json_dump({'prompts': texts, 'outputs': predictions, 'tracks': tracks}, f'{output_dir}/decoding_tracks_step_sample{self.args.max_n_tokens_per_step}.json')
-            else:
-                json_dump({'prompts': texts, 'outputs': predictions, 'tracks': tracks}, f'{output_dir}/decoding_tracks_step{self.args.max_n_tokens_per_step}.json')
+            # if self.args.do_sample:
+            #     json_dump({'prompts': texts, 'outputs': predictions, 'tracks': tracks}, f'{output_dir}/decoding_tracks_step_sample{self.args.max_n_tokens_per_step}.json')
+            # else:
+            #     json_dump({'prompts': texts, 'outputs': predictions, 'tracks': tracks}, f'{output_dir}/decoding_tracks_step{self.args.max_n_tokens_per_step}.json')
+            json_dump({'prompts': texts, 'outputs': predictions, 'tracks': tracks}, f'{output_dir}/decoding_tracks_step_denoise.json')
         else:
             # Gather results from all processes
             max_key = torch.tensor(max(losses.keys()), device=self.args.device)
@@ -233,7 +229,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 json_dump(losses, f'{output_dir}/losses_ratio{self.args.eval_mask_ratio}.json')
             else:
                 json_dump(losses, f'{output_dir}/losses.json')
-            
+        
         dist.barrier()
         assert False, '''only for evaluation'''
         
@@ -389,7 +385,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             ##=== extract label positions ===##
             is_label = labels[i].ne(IGNORE_INDEX)
             label_position_ids = is_label.nonzero().squeeze(-1)
-            
+            # import ipdb; ipdb.set_trace()
             ##=== shuffle and mask ===##
             mask_label_position_ids, mask_threshold = shuffle_and_mask(label_position_ids, self.mask_ratio_generator,
                                                                        fixed_mask_threshold=fixed_mask_threshold, 

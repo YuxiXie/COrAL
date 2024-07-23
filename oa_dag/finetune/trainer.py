@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 from tqdm import tqdm
 
@@ -26,7 +27,7 @@ import torch.distributed as dist
 
 from oa_dag.datasets import SupervisedDataset, PromptOnlyDataset
 from oa_dag.trainers import SupervisedTrainer
-from oa_dag.utils import get_all_reduce_mean, is_main_process, to_device
+from oa_dag.utils import get_all_reduce_mean, is_main_process, to_device, json_dump
 
 
 class SupervisedFinetuneTrainer(SupervisedTrainer):
@@ -41,6 +42,9 @@ class SupervisedFinetuneTrainer(SupervisedTrainer):
         """Evaluate the model on the evaluation dataset."""
         if self.eval_dataloader is None:
             return {}
+        
+        output_dir = '/'.join(self.args.model_name_or_path.split('/')[:-1])
+        os.makedirs(output_dir, exist_ok=True)
 
         self.set_eval()
         prompts: list[str] = []
@@ -75,7 +79,7 @@ class SupervisedFinetuneTrainer(SupervisedTrainer):
             # import ipdb; ipdb.set_trace()
             if cnt > 100: break
         dist.barrier()
-        
+        json_dump({'prompts': prompts, 'outputs': generateds,}, f'{output_dir}/decoding_tracks.json')
         import ipdb; ipdb.set_trace()
     
     def loss(

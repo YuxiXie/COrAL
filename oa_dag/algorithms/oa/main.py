@@ -346,6 +346,11 @@ def parse_arguments() -> argparse.Namespace:
         action='store_true',
     )
     evaluation_parser.add_argument(
+        '--verbal_decoding',
+        default=False,
+        action='store_true',
+    )
+    evaluation_parser.add_argument(
         '--do_decoding',
         default=False,
         action='store_true',
