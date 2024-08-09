@@ -27,6 +27,7 @@ from typing import Any, Callable, Generator, TypeVar, cast
 from typing_extensions import TypeAlias  # Python 3.10+
 import scipy.stats as stats
 
+import re
 import math
 import numpy as np
 import optree
@@ -336,55 +337,54 @@ def pad_tensors(tensors, max_len=-1, pad_value=IGNORE_INDEX):
 
 
 def shuffle_and_mask(label_position_ids: torch.LongTensor, ratio_generator, left2right=False, fixed_mask_threshold=-1, device=None):
-    keep_sample = True
-    while keep_sample:
-        if fixed_mask_threshold >= 0:
-            mask_threshold = fixed_mask_threshold
-        else:
-            # sample to get masking threshold
-            mask_threshold = ratio_generator.rvs(1)[0]
+    # keep_sample = True
+    # while keep_sample:
+    #     if fixed_mask_threshold >= 0:
+    #         mask_threshold = fixed_mask_threshold
+    #     else:
+    #         # sample to get masking threshold
+    #         mask_threshold = ratio_generator.rvs(1)[0]
         
-        if left2right:  # mask the right part
-            random_noise = torch.arange(0, label_position_ids.size(-1), dtype=torch.float, device=device)
-            random_noise = (-random_noise + label_position_ids.size(-1) - 0.5) / label_position_ids.size(-1)    # reverse to be descending
-        else:   # randomly mask
-            random_noise = torch.rand(label_position_ids.size(-1), device=device)
+    #     if left2right:  # mask the right part
+    #         random_noise = torch.arange(0, label_position_ids.size(-1), dtype=torch.float, device=device)
+    #         random_noise = (-random_noise + label_position_ids.size(-1) - 0.5) / label_position_ids.size(-1)    # reverse to be descending
+    #     else:   # randomly mask
+    #         random_noise = torch.rand(label_position_ids.size(-1), device=device)
         
-        # extract the position ids of the tokens to mask
-        mask_label_position_ids = label_position_ids[random_noise.lt(mask_threshold).nonzero().squeeze(-1)]
-        if mask_label_position_ids.size(0) > 0 or label_position_ids.size(0) <= 0:
-            keep_sample = False
+    #     # extract the position ids of the tokens to mask
+    #     mask_label_position_ids = label_position_ids[random_noise.lt(mask_threshold).nonzero().squeeze(-1)]
+    #     if mask_label_position_ids.size(0) > 0 or label_position_ids.size(0) <= 0:
+    #         keep_sample = False
+    
+    # return mask_label_position_ids, mask_threshold
+    
+    if fixed_mask_threshold >= 0:
+        mask_threshold = fixed_mask_threshold
+    else:
+        # sample to get masking threshold
+        mask_threshold = ratio_generator.rvs(1)[0]
+    
+    if left2right:  # mask the right part
+        random_noise = torch.arange(0, label_position_ids.size(-1), dtype=torch.float, device=device)
+        random_noise = (-random_noise + label_position_ids.size(-1) - 0.5) / label_position_ids.size(-1)    # reverse to be descending
+    else:   # randomly mask
+        random_noise = torch.rand(label_position_ids.size(-1), device=device)
+    
+    # extract the position ids of the tokens to mask
+    mask_label_position_ids = label_position_ids[random_noise.lt(mask_threshold).nonzero().squeeze(-1)]
     
     return mask_label_position_ids, mask_threshold
 
 
-def add_noise(cur_input_ids: torch.LongTensor, cur_labels: torch.LongTensor, ratio_generator, 
-              fixed_replace_threshold=-1, replace_with_prob=1.0, device=None):
-    keep_sample = True
-    while keep_sample:
-        if fixed_replace_threshold >= 0:
-            replace_threshold = fixed_replace_threshold
-        else:
-            # sample the threshold for reconstruction
-            replace_threshold = ratio_generator.rvs(1)[0]
-        random_noise = torch.rand(cur_input_ids.size(-1), device=device)
-        if cur_labels.ne(IGNORE_INDEX).any().item():
-            # replace_ids = torch.logical_and(random_noise.lt(replace_threshold), cur_labels.ne(IGNORE_INDEX)).nonzero().squeeze(-1)    # TODO: original version - only re-predict part of the tokens
-            replace_ids = torch.logical_and(random_noise.le(1), cur_labels.ne(IGNORE_INDEX)).nonzero().squeeze(-1)  # TODO: re-predict all tokens
-        else:
-            replace_ids = random_noise.le(replace_threshold).nonzero().squeeze(-1)
-        if replace_threshold <= 0 or replace_ids.size(0) > 0:
-            keep_sample = False
-    
-    # replace input ids to reconstruct
-    new_replace_ids = None
-    if replace_with_prob < 1:
-        replace_with_prob = replace_threshold     # TODO: replace with higher probability when re-predicting all tokens
-        # replace with probability < 1, so otherwise it should remain the same
-        random_noise = torch.rand(replace_ids.size(-1), device=device)
-        new_replace_ids = replace_ids[random_noise.lt(replace_with_prob).nonzero().squeeze(-1)]
-    
-    return replace_ids, new_replace_ids, replace_threshold
+def add_noise(cur_input_ids: torch.LongTensor, cur_labels: torch.LongTensor, ratio_generator, fixed_replace_threshold=-1, device=None):
+    if fixed_replace_threshold >= 0:
+        replace_threshold = fixed_replace_threshold
+    else:
+        # sample the threshold for reconstruction
+        replace_threshold = ratio_generator.rvs(1)[0]
+    random_noise = torch.rand(cur_input_ids.size(-1), device=device)
+    replace_ids = torch.logical_and(random_noise.lt(replace_threshold), cur_labels.ne(IGNORE_INDEX)).nonzero().squeeze(-1)
+    return replace_ids, replace_threshold
 
 
 def decode_masked_text(input_ids: torch.LongTensor, position_ids: torch.LongTensor, replace_indexes: torch.LongTensor, tokenizer, topk_ids: torch.LongTensor = None):
@@ -397,62 +397,68 @@ def decode_masked_text(input_ids: torch.LongTensor, position_ids: torch.LongTens
     return text
 
 
-def corrupt_input(replace_ids: torch.LongTensor, input_ids: torch.LongTensor, raw_input_ids: torch.LongTensor, position_ids: torch.LongTensor, labels: torch.LongTensor, 
-                  raw_labels: torch.LongTensor, tokenizer, insert_ratio: float=0.0, max_length: int=512, max_repeat_times: int=5, device=None):
+def corrupt_input(replace_ids: torch.LongTensor, input_ids: torch.LongTensor, position_ids: torch.LongTensor, labels: torch.LongTensor, 
+                  tokenizer, device=None):
     # random tokens
     random_ids = torch.randint(tokenizer.vocab_size, replace_ids.size(), device=device)    
     # shifted results
     left_shifted_position_ids, right_shifted_position_ids = position_ids[replace_ids] - 1, position_ids[replace_ids] + 1
-    if right_shifted_position_ids.max() >= raw_input_ids.size(-1):
+    if right_shifted_position_ids.max() >= input_ids.size(-1):
         right_shifted_position_ids[right_shifted_position_ids.eq(right_shifted_position_ids.max()).nonzero().squeeze(-1)] = 0
-    left_shifted_ids, right_shifted_ids = raw_input_ids[left_shifted_position_ids], raw_input_ids[right_shifted_position_ids]
+    left_shifted_ids, right_shifted_ids = input_ids[left_shifted_position_ids], input_ids[right_shifted_position_ids]
     
-    start_position_id = raw_labels.ge(0).nonzero().min()
-    end_position_id = position_ids.max()
-    mask_position_ids = [i for i in range(start_position_id.item(), end_position_id.item()) if i not in position_ids]
-    d = min(int(insert_ratio * len(mask_position_ids)), len(mask_position_ids))
-    d = d if d == 0 else random.randint(1, d)
-    mask_position_ids = sorted(random.sample(mask_position_ids, d))
-    
-    k = min(int(insert_ratio * (replace_ids.size(-1) - 1)), max_length - input_ids.size(-1))
-    max_repeat_times = min(int((max_length - input_ids.size(-1)) // max(1, k)), max_repeat_times)
-    
-    if k > 0 and random.random() <= .5:
-        # insert tokens
-        perm = torch.randperm(replace_ids.size(-1) - 1, device=device)[:k]
-        insert_ids = replace_ids[perm.sort(descending=True).values]
-        generator = stats.truncnorm(-.5, max_repeat_times - .5, loc=0.5, scale=1)
-        for _id in insert_ids:
-            repeat_cnt = math.ceil(generator.rvs(1)[0])
-            input_ids = torch.cat((input_ids[:_id + 1], input_ids[_id:_id + 1].repeat(repeat_cnt), input_ids[_id + 1:]), dim=-1)
-            position_ids = torch.cat((position_ids[:_id + 1], torch.arange(1, repeat_cnt + 1, dtype=torch.long, device=device) + position_ids[_id].item(), 
-                                      position_ids[_id + 1:-1] + repeat_cnt, position_ids[-1:]), dim=-1)
-        existing_position_ids = position_ids[position_ids.lt(raw_input_ids.size(-1)).nonzero().squeeze(-1)]
-        addional_position_ids = position_ids[position_ids.ge(raw_input_ids.size(-1)).nonzero().squeeze(-1)]
-        if addional_position_ids.size(-1) > 0:
-            labels = torch.cat((raw_labels[existing_position_ids], torch.tensor([tokenizer.eos_token_id] * addional_position_ids.size(-1), dtype=torch.long, device=device)), dim=-1)
+    for idx in range(replace_ids.size(-1)):
+        _id = replace_ids[idx]
+        var = random.random()
+        if var < .05:
+            # random tokens
+            input_ids[_id] = random_ids[idx]
+        elif var < .15:
+            # random tokens in the context
+            input_ids[_id] = input_ids[random.randint(0, input_ids.size(-1) - 1)]
         else:
-            labels = raw_labels[position_ids]
-    elif d > 0:
-        for _id in mask_position_ids[::-1]:
-            position_ids[position_ids.gt(_id).nonzero().squeeze(-1)] = position_ids[position_ids.gt(_id).nonzero().squeeze(-1)] - 1
-        labels = raw_labels[position_ids]
-    else:
-        for idx in range(replace_ids.size(-1)):
-            _id = replace_ids[idx]
+            # neighboring tokens
             var = random.random()
-            if var < .05:
-                # random tokens
-                input_ids[_id] = random_ids[idx]
-            elif var < .15:
-                # random tokens in the context
-                input_ids[_id] = raw_input_ids[random.randint(0, raw_input_ids.size(-1) - 1)]
+            if var < .5:
+                input_ids[_id] = left_shifted_ids[idx]
             else:
-                # neighboring tokens
-                var = random.random()
-                if var < .5:
-                    input_ids[_id] = left_shifted_ids[idx]
-                else:
-                    input_ids[_id] = right_shifted_ids[idx]
+                input_ids[_id] = right_shifted_ids[idx]
 
-    return input_ids, position_ids, labels
+    return input_ids
+
+
+operators = '+-*x/÷%=()}{[]$¥<>'
+
+def locate_quantity(topk_ids: torch.LongTensor, tokenizer):
+    sequences = tokenizer.batch_decode(topk_ids[:, :1])
+    quantity_seq_ids = [(True if re.search(r'\d', seq) or any(x in seq for x in operators) else False) for seq in sequences]
+    return torch.tensor(quantity_seq_ids, dtype=torch.bool, device=topk_ids.device)
+
+
+def replace_with_zero_one(topk_probs: torch.FloatTensor):
+    batch_size, k = topk_probs.size(0), topk_probs.size(-1)
+    topk_probs = topk_probs.view(-1, k).contiguous()
+    random_noise = torch.rand(topk_probs.size(0), device=topk_probs.device)
+    to_replace_ids = random_noise.le(.5).nonzero().squeeze(-1)
+    if to_replace_ids.size(-1) > 0:
+        selected_indexes = torch.randint(k, (to_replace_ids.size(-1),)).to(topk_probs.device)
+        new_probs = torch.zeros_like(topk_probs[to_replace_ids], dtype=torch.float)
+        for i in range(len(selected_indexes)):
+            new_probs[i][selected_indexes[i].item()] = 1
+        topk_probs[to_replace_ids] = new_probs
+    return topk_probs.view(batch_size, -1, k).contiguous()
+
+
+def get_normal_dist(mean=0.0, std=1.0, window_size=4, r=1):
+    import torch.distributions as distr
+    
+    mean = torch.tensor([mean])
+    std = torch.tensor([std])
+    normal = distr.Normal(mean, std)
+
+    # Calculate probability density function (PDF)
+    x = torch.linspace(-r, r, window_size * 2 + 1)
+    return torch.exp(normal.log_prob(x))
+    
+    # x = torch.linspace(-2, 2, window_size * 2 + 3)
+    # return torch.exp(normal.log_prob(x))[2:]

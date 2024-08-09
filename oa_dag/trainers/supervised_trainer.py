@@ -37,7 +37,7 @@ from oa_dag.configs import ADAM_BETAS
 from oa_dag.datasets import TokenizedDataset
 from oa_dag.models import load_pretrained_models
 from oa_dag.trainers.base import TrainerBase
-from oa_dag.utils import get_optimizer_grouped_parameters, is_main_process, to_device
+from oa_dag.utils import get_optimizer_grouped_parameters, is_main_process, to_device, get_all_reduce_mean
 
 
 class SupervisedTrainer(TrainerBase):
@@ -194,7 +194,7 @@ class SupervisedTrainer(TrainerBase):
     def train(self) -> None:
         """Train the model."""
         self.logger.print('***** Running training *****')
-
+        
         progress_bar = tqdm(
             total=self.args.epochs * len(self.train_dataloader),
             desc=f'Training 1/{self.args.epochs} epoch',
@@ -232,23 +232,14 @@ class SupervisedTrainer(TrainerBase):
                 
                 ##=== generate batch (with noise) ===##
                 self.set_eval()
-                if self.TRAINING_TYPE == 'sft' or self.args.vanilla_shuffle:
-                    oa_batch = to_device(batch, self.args.device)
-                else:
-                    oa_batch = self.create_oa_batch(to_device(batch, self.args.device))
+                oa_batch = self.create_oa_batch(to_device(batch, self.args.device))
                 torch.cuda.empty_cache()
                 
                 ##=== training ===##
                 self.set_train()
-                # info = self.train_step(**to_device(batch, self.args.device))
-                if self.TRAINING_TYPE == 'sft':
-                    info = self.train_step(**oa_batch)
-                elif self.args.vanilla_shuffle:
-                    info = self.vanilla_shuffle_train_step(**oa_batch)
-                else:
-                    info = self.train_step(**oa_batch)
-                get_accelerator().empty_cache()
+                info = self.train_step(**oa_batch)
                 torch.cuda.empty_cache()
+                get_accelerator().empty_cache()
 
                 self.global_step += 1
                 progress_bar.set_description(

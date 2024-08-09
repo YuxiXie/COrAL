@@ -82,26 +82,16 @@ def parse_arguments() -> argparse.Namespace:
 
     # Training
     training_parser = parser.add_argument_group('training')
+    training_parser.add_argument(
+        '--left2right',
+        default=False,
+        action='store_true',
+    )
     # - for denoising
     training_parser.add_argument(
-        '--random_noise',
-        default=False,
-        action='store_true',
-    )
-    training_parser.add_argument(
-        '--reconstruct',
-        default=False,
-        action='store_true',
-    )
-    training_parser.add_argument(
-        '--insert_with_prob',
-        default=0.0,
-        type=float,
-    )
-    training_parser.add_argument(
-        '--replace_with_prob',
-        type=float,
-        default=1.0,
+        '--context_window',
+        default=8,
+        type=int,
     )
     training_parser.add_argument(
         '--replace_ratio_min',
@@ -131,89 +121,6 @@ def parse_arguments() -> argparse.Namespace:
     )
     training_parser.add_argument(
         '--tune_lm_head',
-        default=False,
-        action='store_true',
-    )
-    # - for mask & reconstruction
-    training_parser.add_argument(
-        '--mask_ratio_min',
-        type=float,
-        default=0.5,
-    )
-    training_parser.add_argument(
-        '--mask_ratio_max',
-        type=float,
-        default=1.0,
-    )
-    training_parser.add_argument(
-        '--dynamic_mask_ratio_mu',
-        default=False,
-        action='store_true',
-    )
-    training_parser.add_argument(
-        '--min_mask_ratio_mu',
-        type=float,
-        default=0.05,
-    )
-    training_parser.add_argument(
-        '--max_mask_ratio_mu',
-        type=float,
-        default=0.95,
-    )
-    training_parser.add_argument(
-        '--mask_ratio_mu',
-        type=float,
-        default=0.55,
-    )
-    training_parser.add_argument(
-        '--mask_ratio_std',
-        type=float,
-        default=0.25,
-    )
-    # - for left-to-right consecutive mask & reconstruction
-    training_parser.add_argument(
-        '--mage_consecutive',
-        default=False,
-        action='store_true',
-    )
-    training_parser.add_argument(
-        '--mage_shuffle',
-        default=False,
-        action='store_true',
-    )
-    # - for shuffle input order
-    training_parser.add_argument(
-        '--init_shuffle_ratio_mage',
-        type=float,
-        default=0.25,
-    )
-    training_parser.add_argument(
-        '--max_shuffle_ratio_mage',
-        type=float,
-        default=0.5,
-    )
-    training_parser.add_argument(
-        '--vanilla_shuffle',
-        default=False,
-        action='store_true',
-    )
-    training_parser.add_argument(
-        '--init_shuffle_ratio',
-        type=float,
-        default=0.5,
-    )
-    training_parser.add_argument(
-        '--max_shuffle_ratio',
-        type=float,
-        default=1.0,
-    )
-    training_parser.add_argument(
-        '--n_shuffle',
-        type=int,
-        default=1,
-    )
-    training_parser.add_argument(
-        '--exclude_l2r_order',
         default=False,
         action='store_true',
     )

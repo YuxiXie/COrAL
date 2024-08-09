@@ -119,7 +119,7 @@ class OAModelMixin:
     
     LAYER_TYPE = nn.Module
     
-    def init_oa_layer(self, config: PretrainedConfig, additional_layer: bool) -> None:
+    def init_oa_layer(self, config: PretrainedConfig, additional_layer: bool = False) -> None:
         """"""
         self.additional_layer = additional_layer
         if self.additional_layer:

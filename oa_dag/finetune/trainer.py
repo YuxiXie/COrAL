@@ -25,6 +25,7 @@ from transformers import AutoModelForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast
 import torch.distributed as dist
 
+from oa_dag.models.oa_model import AutoModelForOA
 from oa_dag.datasets import SupervisedDataset, PromptOnlyDataset
 from oa_dag.trainers import SupervisedTrainer
 from oa_dag.utils import get_all_reduce_mean, is_main_process, to_device, json_dump
@@ -36,7 +37,7 @@ class SupervisedFinetuneTrainer(SupervisedTrainer):
     TRAINING_TYPE = 'sft'
     DATASET_TYPE = SupervisedDataset
     EVAL_DATA_TYPE = PromptOnlyDataset
-    MODEL_TYPE = AutoModelForCausalLM
+    MODEL_TYPE = AutoModelForOA     # AutoModelForCausalLM
     
     def eval(self) -> dict[str, Any]:
         """Evaluate the model on the evaluation dataset."""
