@@ -81,14 +81,11 @@ class MistralAttentionOA(MistralAttention):
                 )
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
         # prepare cos & sin for positional encoding
-        cos, sin = self.rotary_emb(value_states, seq_len=(torch.cat((position_ids, position_ids_to_predict), dim=-1) if position_ids_to_predict is not None else position_ids).max().item() + 1)
-        # clone the original query_states for position embedding
-        raw_query_states = query_states.clone()
+        cos, sin = self.rotary_emb(value_states, seq_len=position_ids.max().item() + 1)
         
         if position_ids_to_predict is not None:
             # position embedding for last layer
             key_states = apply_rotary_pos_emb_single(key_states, cos, sin, position_ids)
-            query_states = apply_rotary_pos_emb_single(query_states, cos, sin, torch.cat((position_ids[:, 1:].contiguous(), position_ids[:, :1].contiguous()), dim=-1))
         else:
             # original position embedding
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)        
@@ -113,18 +110,17 @@ class MistralAttentionOA(MistralAttention):
             attn_weights = attn_weights + attention_mask
         
         if position_ids_to_predict is not None:
-            for i in range(position_ids_to_predict.size(-1)):
-                # extract the corresponding query (at the next specific positions)
-                query_states = torch.stack([raw_query_states[b_id, :, positions_to_replace[b_id] - 1, :].contiguous() for b_id in range(raw_query_states.size(0))], dim=0)
-                # apply position encoding
-                query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids_to_predict[:, i].unsqueeze(-1))
-                
-                # update attention weights
-                update_attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-                if attention_mask is not None:
-                    corr_attention_mask = torch.stack([attention_mask[b_id, :, positions_to_replace[b_id] - 1, :].contiguous() for b_id in range(attention_mask.size(0))], dim=0)
-                    update_attn_weights = update_attn_weights + corr_attention_mask
-                attn_weights = torch.cat((attn_weights, update_attn_weights), dim=2)
+            # extract the corresponding query (at the next specific positions)
+            new_query_states = query_states.unsqueeze(-2).expand(bsz, query_states.size(1), q_len, position_ids_to_predict.size(-1), query_states.size(-1)).contiguous().view(bsz, query_states.size(1), -1, query_states.size(-1))
+            # apply position encoding
+            query_states = apply_rotary_pos_emb_single(new_query_states, cos, sin, position_ids_to_predict.view(bsz, -1))
+            
+            # update attention weights
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+            if attention_mask is not None:
+                # update attention mask
+                attention_mask = attention_mask.unsqueeze(-2).expand(bsz, 1, q_len, position_ids_to_predict.size(-1), kv_seq_len).contiguous().view(bsz, 1, -1, kv_seq_len)
+                attn_weights = attn_weights + attention_mask
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
@@ -196,13 +192,10 @@ class MistralSdpaAttentionOA(MistralAttentionOA):
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
         # prepare cos & sin for positional encoding
         cos, sin = self.rotary_emb(value_states, seq_len=position_ids.max().item() + 1)
-        # clone the original query_states for position embedding
-        raw_query_states = query_states.clone()
 
         if position_ids_to_predict is not None:
             # position embedding for last layer
             key_states = apply_rotary_pos_emb_single(key_states, cos, sin, position_ids)
-            query_states = apply_rotary_pos_emb_single(query_states, cos, sin, torch.cat((position_ids[:, 1:].contiguous(), position_ids[:, :1].contiguous()), dim=-1))
         else:
             # original position embedding
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
@@ -222,15 +215,15 @@ class MistralSdpaAttentionOA(MistralAttentionOA):
 
         if position_ids_to_predict is not None:
             # extract the corresponding query (at the next specific positions)
-            new_query_states = raw_query_states.unsqueeze(-2).expand(bsz, raw_query_states.size(1), q_len, position_ids_to_predict.size(-1), raw_query_states.size(-1)).contiguous().view(bsz, raw_query_states.size(1), -1, raw_query_states.size(-1))
-            new_query_states = apply_rotary_pos_emb_single(new_query_states, cos, sin, position_ids_to_predict.view(bsz, -1))
+            # (B, n_head, L, 2W+1, n_dim) --> (B, n_head, L * (2W+1), n_dim)
+            new_query_states = query_states.unsqueeze(-2).expand(bsz, query_states.size(1), q_len, position_ids_to_predict.size(-1), query_states.size(-1)).contiguous().view(bsz, query_states.size(1), -1, query_states.size(-1))
+            # apply position encoding
+            query_states = apply_rotary_pos_emb_single(new_query_states, cos, sin, position_ids_to_predict.view(bsz, -1))
+            
             if attention_mask is not None:
-                new_attention_mask = torch.zeros(bsz, new_query_states.size(-2), key_states.size(-2), dtype=attention_mask.dtype, device=attention_mask.device)
-                for i in range(bsz):
-                    # update attention mask
-                    new_attention_mask[i] = attention_mask[i][0][position_ids_to_predict[i].view(-1)]
-                attention_mask = new_attention_mask.unsqueeze(1)
-            query_states = new_query_states
+                # update attention mask
+                # (B, 1, L * (2W+1), L)
+                attention_mask = attention_mask.unsqueeze(-2).expand(bsz, 1, q_len, position_ids_to_predict.size(-1), kv_seq_len).contiguous().view(bsz, 1, -1, kv_seq_len)
         
         # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
         # Reference: https://github.com/pytorch/pytorch/issues/112577.
