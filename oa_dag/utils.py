@@ -449,7 +449,7 @@ def replace_with_zero_one(topk_probs: torch.FloatTensor):
     return topk_probs.view(batch_size, -1, k).contiguous()
 
 
-def get_normal_dist(mean=0.0, std=1.0, window_size=4, r=1):
+def get_normal_dist(mean=0.0, std=1.0, forward_size=4, backward_size=4, r=1):
     import torch.distributions as distr
     
     mean = torch.tensor([mean])
@@ -457,8 +457,10 @@ def get_normal_dist(mean=0.0, std=1.0, window_size=4, r=1):
     normal = distr.Normal(mean, std)
 
     # Calculate probability density function (PDF)
+    window_size = max(forward_size, backward_size)
     x = torch.linspace(-r, r, window_size * 2 + 1)
-    return torch.exp(normal.log_prob(x))
+    x = torch.exp(normal.log_prob(x))
     
-    # x = torch.linspace(-2, 2, window_size * 2 + 3)
-    # return torch.exp(normal.log_prob(x))[2:]
+    mid_idx = len(x) // 2
+    return x[mid_idx - backward_size: mid_idx + forward_size + 1]
+    

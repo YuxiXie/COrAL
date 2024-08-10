@@ -22,7 +22,7 @@ MODEL_NAME_OR_PATH="mistralai/Mistral-7B-v0.3"
 # MODEL_NAME_OR_PATH="/share/edc/home/yuxi_xie/oa_dag/checkpoints/oa/metamath-mistral/correction-mu0.05to0.55-dymin-rmu0.55-insert0.25-delete0.25-e3/checkpoint-30720"
 # MODEL_NAME_OR_PATH="/share/edc/home/yuxi_xie/oa_dag/checkpoints/oa/small-metamath-mistral/interleaved-mu0.05to0.55-rmu0.25-e3/checkpoint-21822"
 # OUTPUT_DIR="/share/edc/home/yuxi_xie/oa_dag/checkpoints/oa/small-metamath-mistral/correction-mu0.05to0.55-dymin-rmu0.55-insert0.5-l2r-e3"
-OUTPUT_DIR="/share/edc/home/yuxi_xie/oa_dag/checkpoints/oa/full_dependency/cw16_r0.25_len1024"
+OUTPUT_DIR="/share/edc/home/yuxi_xie/oa_dag/checkpoints/oa/full_dependency/cw8_nb2_r0.25_len512"
 unset HOSTFILE
 ZERO_STAGE=3
 OFFLOAD="none"
@@ -60,8 +60,9 @@ deepspeed --include localhost:$gpu_vis --master_port $MASTER_PORT \
 	--model_type metamath \
 	--not_lazy_tokenization \
 	--model_name_or_path "${MODEL_NAME_OR_PATH}" \
-	--max_length 1024 \
-	--context_window 16 \
+	--max_length 512 \
+	--context_window 8 \
+	--n_back_pred 2 \
 	--trust_remote_code True \
 	--epochs 3 \
 	--save_interval 10240 \
@@ -69,9 +70,9 @@ deepspeed --include localhost:$gpu_vis --master_port $MASTER_PORT \
 	--replace_ratio_std 0.5 \
 	--replace_ratio_max 1.0 \
 	--replace_ratio_min 0.0 \
-	--per_device_train_batch_size 1 \
+	--per_device_train_batch_size 2 \
 	--per_device_eval_batch_size 4 \
-	--gradient_accumulation_steps 16 \
+	--gradient_accumulation_steps 8 \
 	--gradient_checkpointing \
 	--learning_rate 2e-5 \
 	--lr_scheduler_type cosine \

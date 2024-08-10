@@ -94,6 +94,11 @@ def parse_arguments() -> argparse.Namespace:
         type=int,
     )
     training_parser.add_argument(
+        '--n_back_pred',
+        default=1,
+        type=int,
+    )
+    training_parser.add_argument(
         '--replace_ratio_min',
         type=float,
         default=0.0,
@@ -271,11 +276,6 @@ def parse_arguments() -> argparse.Namespace:
         '--denoising',
         default=False,
         action='store_true',
-    )
-    evaluation_parser.add_argument(
-        '--eval_mask_ratio',
-        type=float,
-        default=1.0,
     )
     evaluation_parser.add_argument(
         '--eval_replace_ratio',
