@@ -20,6 +20,11 @@ class MetaMathDataset(RawDataset):
 
     def __init__(self, path: str | None = None) -> None:
         self.data = load_dataset(path or self.PATH, split=self.SPLIT)
+        # self.data = list(self.data)[:1000]
+        if self.NAME.count('valid'):
+            self.data = list(self.data)[:1000]
+        # gsm8k_questions = [x['question'] for x in load_dataset('openai/gsm8k', 'main', split='train')]
+        # self.data = [x for x in self.data if x['original_question'] in gsm8k_questions]
 
     def __getitem__(self, index: int) -> RawSample:
         data = self.data[index]

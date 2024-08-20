@@ -94,6 +94,11 @@ def parse_arguments() -> argparse.Namespace:
     # Training
     training_parser = parser.add_argument_group('training')
     training_parser.add_argument(
+        '--no_noise',
+        default=False,
+        action='store_true',
+    )
+    training_parser.add_argument(
         '--left2right',
         default=False,
         action='store_true',

@@ -88,11 +88,13 @@ class SupervisedFinetuneTrainer(SupervisedTrainer):
         input_ids: torch.LongTensor,  # size = (B, L)
         labels: torch.LongTensor,  # size = (B, L)
         attention_mask: torch.BoolTensor,  # size = (B, L)
+        position_ids_to_predict: torch.LongTensor,  # size = (B, L, N)
     ) -> dict[str, torch.Tensor]:
         """Loss function for supervised finetuning."""
         outputs: CausalLMOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            position_ids_to_predict=position_ids_to_predict,
             labels=labels,
         )
         
@@ -116,8 +118,17 @@ class SupervisedFinetuneTrainer(SupervisedTrainer):
         Returns:
             dict[str, Any]: training loss, learning rate
         """
+        position_ids_to_predict = torch.arange(1, dtype=torch.long, device=self.args.device)
+        position_ids_to_predict = (position_ids_to_predict + 1) + torch.arange(input_ids.size(-1) - 1, dtype=torch.long, device=self.args.device).view(-1, 1)
+        position_ids_to_predict = position_ids_to_predict.unsqueeze(0).expand(input_ids.size(0), input_ids.size(-1) - 1, 1).contiguous()
+
+        input_ids = input_ids[:, :-1].contiguous()
+        attention_mask = attention_mask[:, :-1].contiguous()
+        labels = labels[:, 1:].unsqueeze(-1).contiguous()
+        
         loss = self.loss(
             input_ids=input_ids,
+            position_ids_to_predict=position_ids_to_predict,
             labels=labels,
             attention_mask=attention_mask,
         )['loss']

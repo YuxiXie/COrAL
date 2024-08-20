@@ -126,3 +126,4 @@ class OAModelMixin:
             self.oa_layer = self.LAYER_TYPE(config, config.num_hidden_layers)
         else:
             self.oa_layer = self.model.layers[-1]
+        self.model.oa_layer = self.oa_layer

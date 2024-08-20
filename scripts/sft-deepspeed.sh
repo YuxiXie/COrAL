@@ -13,13 +13,13 @@ export PYTHONPATH="${ROOT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export LOGLEVEL="${LOGLEVEL:-WARNING}"
 
 # MODEL_NAME_OR_PATH="huggyllama/llama-7b"
-# MODEL_NAME_OR_PATH="mistralai/Mistral-7B-v0.3"
+MODEL_NAME_OR_PATH="mistralai/Mistral-7B-v0.3"
 # MODEL_NAME_OR_PATH="meta-llama/Meta-Llama-3-8B"
-MODEL_NAME_OR_PATH="meta-llama/Llama-2-13b-hf"
-OUTPUT_DIR="/share/edc/home/yuxi_xie/oa_dag/checkpoints/sft/metamath-llama2-13b"
+# MODEL_NAME_OR_PATH="/share/edc/home/yuxi_xie/oa_dag/checkpoints/sft/metamath-oa-mistral/checkpoint-98750"
+OUTPUT_DIR="/share/edc/home/yuxi_xie/oa_dag/checkpoints/sft/norm_full_dependency/metamath-mistral"
 unset HOSTFILE
-ZERO_STAGE=2
-OFFLOAD="all"
+ZERO_STAGE=3
+OFFLOAD="none"
 
 mkdir -p "${OUTPUT_DIR}"
 OUTPUT_DIR="$(cd "${OUTPUT_DIR}" &>/dev/null && pwd)"
@@ -46,29 +46,33 @@ MASTER_PORT="$(
 
 exec 1> >(tee "${OUTPUT_DIR}/stdout.log" >&1) 2> >(tee "${OUTPUT_DIR}/stderr.log" >&2)
 
-gpu_vis=2
+gpu_vis=4,5,6,7,0,1,2,3
 
 deepspeed --include localhost:$gpu_vis --master_port $MASTER_PORT \
 	--module oa_dag.finetune \
 	--train_datasets MetaMath \
 	--model_type metamath \
 	--model_name_or_path "${MODEL_NAME_OR_PATH}" \
-	--max_length 1024 \
+	--max_length 512 \
 	--trust_remote_code True \
 	--epochs 3 \
-	--per_device_train_batch_size 2 \
+	--per_device_train_batch_size 8 \
 	--per_device_eval_batch_size 4 \
-	--gradient_accumulation_steps 16 \
+	--gradient_accumulation_steps 2 \
 	--gradient_checkpointing \
-	--learning_rate 2e-5 \
+	--learning_rate 5e-6 \
 	--lr_scheduler_type cosine \
 	--lr_warmup_ratio 0.03 \
 	--weight_decay 0.0 \
 	--seed 42 \
 	--output_dir "${OUTPUT_DIR}" \
 	--log_type wandb \
-	--log_project OA-SFT \
+	--log_project OA-AR \
 	--zero_stage "${ZERO_STAGE}" \
 	--offload "${OFFLOAD}" \
 	--bf16 True \
 	--tf32 True
+
+
+cd /local/home/yuxi_xie/Projects/OA-DAG
+bash scripts/oa.sh $gpu_vis

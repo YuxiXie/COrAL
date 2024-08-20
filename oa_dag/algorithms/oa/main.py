@@ -83,11 +83,16 @@ def parse_arguments() -> argparse.Namespace:
     # Training
     training_parser = parser.add_argument_group('training')
     training_parser.add_argument(
-        '--left2right',
+        '--no_noise',
         default=False,
         action='store_true',
     )
     # - for denoising
+    training_parser.add_argument(
+        '--pred_gap',
+        default=0,
+        type=int,
+    )
     training_parser.add_argument(
         '--context_window',
         default=8,
@@ -96,7 +101,7 @@ def parse_arguments() -> argparse.Namespace:
     training_parser.add_argument(
         '--n_back_pred',
         default=1,
-        type=int,
+        type=float,
     )
     training_parser.add_argument(
         '--replace_ratio_min',
@@ -219,6 +224,31 @@ def parse_arguments() -> argparse.Namespace:
     # Evaluation
     evaluation_parser = parser.add_argument_group('evaluation')
     evaluation_parser.add_argument(
+        '--decoding_occurance_threshold',
+        type=int,
+        default=3,
+    )
+    evaluation_parser.add_argument(
+        '--left2right',
+        default=False,
+        action='store_true',
+    )
+    evaluation_parser.add_argument(
+        '--add_denoising',
+        default=False,
+        action='store_true',
+    )
+    evaluation_parser.add_argument(
+        '--decoding_block_size',
+        type=int,
+        default=16,
+    )
+    evaluation_parser.add_argument(
+        '--result_fname',
+        type=str,
+        default='results',
+    )
+    evaluation_parser.add_argument(
         '--max_n_tokens_per_step',
         type=int,
         default=1,
@@ -227,6 +257,11 @@ def parse_arguments() -> argparse.Namespace:
         '--temperature',
         type=float,
         default=0.0,
+    )
+    evaluation_parser.add_argument(
+        '--seq_temperature',
+        type=float,
+        default=1.0,
     )
     evaluation_parser.add_argument(
         '--top_p',
@@ -264,16 +299,6 @@ def parse_arguments() -> argparse.Namespace:
     )
     evaluation_parser.add_argument(
         '--do_decoding',
-        default=False,
-        action='store_true',
-    )
-    evaluation_parser.add_argument(
-        '--do_sample',
-        default=False,
-        action='store_true',
-    )
-    evaluation_parser.add_argument(
-        '--denoising',
         default=False,
         action='store_true',
     )
@@ -382,7 +407,11 @@ def main() -> None:
     """Main training routine."""
     args = parse_arguments()
 
-    deepspeed.init_distributed()
+    from datetime import timedelta
+    deepspeed.init_distributed(
+        # dist_backend='nccl' if dist.is_nccl_available() else 'gloo',
+        # timeout=timedelta(seconds=7200000)
+    )
 
     args.global_rank = dist.get_rank()
     args.device = torch.device('cuda', args.local_rank)

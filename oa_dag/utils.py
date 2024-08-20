@@ -376,14 +376,18 @@ def shuffle_and_mask(label_position_ids: torch.LongTensor, ratio_generator, left
     return mask_label_position_ids, mask_threshold
 
 
-def add_noise(cur_input_ids: torch.LongTensor, cur_labels: torch.LongTensor, ratio_generator, fixed_replace_threshold=-1, device=None):
-    if fixed_replace_threshold >= 0:
-        replace_threshold = fixed_replace_threshold
-    else:
-        # sample the threshold for reconstruction
-        replace_threshold = ratio_generator.rvs(1)[0]
-    random_noise = torch.rand(cur_input_ids.size(-1), device=device)
-    replace_ids = torch.logical_and(random_noise.lt(replace_threshold), cur_labels.ne(IGNORE_INDEX)).nonzero().squeeze(-1)
+def add_noise(cur_input_ids: torch.LongTensor, cur_labels: torch.LongTensor, ratio_generator, force_replace=False, fixed_replace_threshold=-1, device=None):
+    keep_generate = True
+    while keep_generate:
+        if fixed_replace_threshold >= 0:
+            replace_threshold = fixed_replace_threshold
+        else:
+            # sample the threshold for reconstruction
+            replace_threshold = ratio_generator.rvs(1)[0]
+        random_noise = torch.rand(cur_input_ids.size(-1), device=device)
+        replace_ids = torch.logical_and(random_noise.lt(replace_threshold), cur_labels.ne(IGNORE_INDEX)).nonzero().squeeze(-1)
+        if not force_replace or fixed_replace_threshold >= 0 or replace_ids.size(-1) > 0:
+            keep_generate = False
     return replace_ids, replace_threshold
 
 
@@ -410,10 +414,10 @@ def corrupt_input(replace_ids: torch.LongTensor, input_ids: torch.LongTensor, po
     for idx in range(replace_ids.size(-1)):
         _id = replace_ids[idx]
         var = random.random()
-        if var < .05:
+        if var < .1:
             # random tokens
             input_ids[_id] = random_ids[idx]
-        elif var < .15:
+        elif var < .6:
             # random tokens in the context
             input_ids[_id] = input_ids[random.randint(0, input_ids.size(-1) - 1)]
         else:

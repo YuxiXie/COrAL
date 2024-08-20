@@ -26,7 +26,7 @@ def run_experiment(gpu_ids):
     # with open('stderr.log', 'w', encoding='utf-8') as f:
     #     f.write(completed_process.stderr)
     gpus = ','.join([str(x) for x in gpu_ids])
-    gradient_accumulation_steps = str(32 // len(gpu_ids))
+    gradient_accumulation_steps = str(16 // len(gpu_ids))
     completed_process = subprocess.run(['bash', 'scripts/sft-sharegpt-mage-add.sh', gpus, gradient_accumulation_steps])
     # completed_process = subprocess.run(['bash', '/home/yuxi/Projects/MCTS-DPO/scripts/reward-model-train-math.sh', f'{gpu_ids[0]}'])
     # completed_process = subprocess.run(['bash', '/home/yuxi/Projects/LLaVA/scripts/v1_5/preference_learning.sh'])
@@ -40,12 +40,13 @@ if __name__ == "__main__":
         sorted_memory = [x for x in sorted_memory if x[0] not in [0,4,3,2]]
         
         if sorted_memory[0][1] > MEMORY_THRESHOLD_MB - 1024:
-            print("Running on gpu", sorted_memory[0][0])
-            time.sleep(10)
+            time.sleep(3)
             free_memory = get_free_gpu_memory()
             sorted_memory = sorted(enumerate(free_memory), key=lambda x:x[1], reverse=True)
             sorted_memory = [x for x in sorted_memory if x[0] not in [0,4,3,2]]
-            run_experiment([sorted_memory[0][0]])
+            gpu_ids = [x[0] for x in sorted_memory]
+            print("Running on gpu", gpu_ids)
+            run_experiment(gpu_ids)
             # break
         else:
             print("Waiting for enough GPU memory. Current free memory: {} GB".format(sum(free_memory) / 1024))

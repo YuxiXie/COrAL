@@ -124,16 +124,18 @@ class SupervisedTrainer(TrainerBase):
         self.train_dataloader = DataLoader(
             train_dataset,
             collate_fn=train_dataset.get_collator(),
-            sampler=DistributedSampler(train_dataset, shuffle=True),
+            sampler=DistributedSampler(train_dataset, shuffle=True, drop_last=True),
             batch_size=self.args.per_device_train_batch_size,
         )
 
     def init_engines(self) -> None:
         """Initialize DeepSpeed engines."""
-        self.args.num_update_steps_per_epoch = (
-            len(self.train_dataloader) + self.args.gradient_accumulation_steps - 1
-        ) // self.args.gradient_accumulation_steps
-        self.args.total_training_steps = self.args.epochs * self.args.num_update_steps_per_epoch
+        self.args.total_training_steps = len(self.train_dataloader) * self.args.epochs
+        if self.args.no_noise:
+            self.args.gradient_accumulation_steps *= 2
+            self.ds_config['train_batch_size'] *= 2
+            self.ds_config['gradient_accumulation_steps'] *= 2
+            self.args.total_training_steps *= 2
 
         optimizer_grouped_parameters = get_optimizer_grouped_parameters(
             self.model,
@@ -155,12 +157,13 @@ class SupervisedTrainer(TrainerBase):
                 betas=ADAM_BETAS,
             )
 
-        num_warmup_steps = int(self.args.lr_warmup_ratio * self.args.total_training_steps)
+        lr_scheduler_update_steps = self.args.total_training_steps // self.ds_config['gradient_accumulation_steps']
+        num_warmup_steps = int(lr_scheduler_update_steps * self.args.lr_warmup_ratio)
         lr_scheduler = get_scheduler(
             name=self.args.lr_scheduler_type,
             optimizer=optimizer,
             num_warmup_steps=num_warmup_steps,
-            num_training_steps=self.args.total_training_steps,
+            num_training_steps=lr_scheduler_update_steps,
         )
 
         self.model, *_ = deepspeed.initialize(
@@ -222,8 +225,8 @@ class SupervisedTrainer(TrainerBase):
             self.logger.log(self.eval(), step=0)
 
         for epoch in range(self.args.epochs):
+            self.train_dataloader.sampler.set_epoch(epoch)
             if epoch < epochs_trained: continue
-            # self.model.train()
 
             for batch in self.train_dataloader:
                 if steps_trained_in_current_epoch > 0:
@@ -232,13 +235,21 @@ class SupervisedTrainer(TrainerBase):
                 
                 ##=== generate batch (with noise) ===##
                 self.set_eval()
-                oa_batch = self.create_oa_batch(to_device(batch, self.args.device))
+                if self.args.no_noise:
+                    oa_batch = self.create_oa_batch(to_device(batch, self.args.device), force_replace=True)
+                    torch.cuda.empty_cache()
+                    noa_batch = self.create_oa_batch(to_device(batch, self.args.device), fixed_replace_threshold=0.0)
+                else:
+                    oa_batch = self.create_oa_batch(to_device(batch, self.args.device))
                 torch.cuda.empty_cache()
                 
                 ##=== training ===##
                 self.set_train()
                 info = self.train_step(**oa_batch)
                 torch.cuda.empty_cache()
+                if self.args.no_noise:
+                    noa_info = self.train_step(**noa_batch)
+                    torch.cuda.empty_cache()
                 get_accelerator().empty_cache()
 
                 self.global_step += 1
@@ -250,6 +261,8 @@ class SupervisedTrainer(TrainerBase):
 
                 info['train/epoch'] = self.global_step / len(self.train_dataloader)
                 self.logger.log(info, step=self.global_step)
+                if self.args.no_noise:
+                    self.logger.log(noa_info, step=self.global_step)
 
                 if self.global_step % self.args.save_interval == 0:
                     self.logger.print(f'Saving checkpoint at step {self.global_step} ...')
