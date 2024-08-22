@@ -6,7 +6,7 @@ from datasets import load_dataset
 from oa_dag.datasets.base import RawDataset, RawSample
 
 
-__all__ = ['MetaMathTrainDataset', 'MetaMathValidDataset', 'GSM8KDataset']
+__all__ = ['MetaMathTrainDataset', 'MetaMathValidDataset', 'GSM8KDataset', 'MATHDataset']
 
 def get_input(query):
     if query.find('\n') == -1:
@@ -20,7 +20,7 @@ class MetaMathDataset(RawDataset):
 
     def __init__(self, path: str | None = None) -> None:
         self.data = load_dataset(path or self.PATH, split=self.SPLIT)
-        # self.data = list(self.data)[:1000]
+        self.data = list(self.data)[:1000]
         if self.NAME.count('valid'):
             self.data = list(self.data)[:1000]
         # gsm8k_questions = [x['question'] for x in load_dataset('openai/gsm8k', 'main', split='train')]
@@ -61,6 +61,23 @@ class GSM8KDataset(RawDataset):
         data = self.data[index]
         input = data['question']
         answer = data['answer']
+        return RawSample(input=input, answer=answer)
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+class MATHDataset(RawDataset):
+    NAME: str = 'MATH'
+    PATH: str = 'hendrycks/competition_math'
+    SPLIT: str = 'test'
+    
+    def __init__(self, path: str | None = None) -> None:
+        self.data = load_dataset(path or self.PATH, split=self.SPLIT, trust_remote_code=True)
+
+    def __getitem__(self, index: int) -> RawSample:
+        data = self.data[index]
+        input = data['problem']
+        answer = data['solution']
         return RawSample(input=input, answer=answer)
 
     def __len__(self) -> int:

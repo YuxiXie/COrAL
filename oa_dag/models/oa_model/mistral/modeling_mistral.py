@@ -813,6 +813,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
             pred_start_pos = fixed_seq_length = seq_length
             weights = get_normal_dist(forward_size=forward_size, backward_size=backward_size).to(input_ids.device)
             occurance_counts = torch.ones_like(input_ids)  # record the occurance times of predicted tokens
+            confidence = torch.ones_like(input_ids).float()
             prev_logits = None
             
             while keep_generate:
@@ -844,12 +845,13 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
                 ref_position_ids_to_predict = position_ids_to_predict[:, seq_length - 1:, :]    # (1, L', N)
                 for i in range(batch_size):
                     for j in range(logits.size(1)):
+                        if seq_length - 1 + j < fixed_seq_length - 1: continue
                         cur_positions_indexes = ref_position_ids_to_predict[i][j].ge(pred_start_pos).nonzero().squeeze(-1)  # get corresponding predicted positions
                         if cur_positions_indexes.size(-1) <= 0: continue
-                        weighted_logits = logits[i, j, cur_positions_indexes] * weights[cur_positions_indexes].unsqueeze(-1)
+                        weighted_logits = logits[i, j, cur_positions_indexes] * (weights[cur_positions_indexes] * confidence[i, seq_length - 1 + j]).unsqueeze(-1)
                         cur_positions = ref_position_ids_to_predict[i, j, cur_positions_indexes]
                         tmp_logits[i, cur_positions - pred_start_pos] = tmp_logits[i, cur_positions - pred_start_pos] + weighted_logits
-                        tmp_weights[i, cur_positions - pred_start_pos] = tmp_weights[i, cur_positions - pred_start_pos] + weights[cur_positions_indexes]
+                        tmp_weights[i, cur_positions - pred_start_pos] = tmp_weights[i, cur_positions - pred_start_pos] + weights[cur_positions_indexes] * confidence[i, seq_length - 1 + j]
                 tmp_weights = tmp_weights.eq(0).float() + tmp_weights
                 logits = tmp_logits / tmp_weights.unsqueeze(-1)    # (1, S, V)
                 
@@ -857,7 +859,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
                 token_scores = processors(input_ids, logits.view(-1, logits.size(-1)))  # (1 * S, V)
                 token_scores = warpers(input_ids, token_scores)  # (1 * S, V)
                 probs = nn.functional.softmax(token_scores, dim=-1)  # (1 * S, V)
-                # results = torch.topk(nn.functional.softmax(logits, dim=-1), k=topk, dim=-1)
+                results = torch.topk(nn.functional.softmax(logits, dim=-1), k=1, dim=-1)
                 # sample and get candidate tokens
                 tokens = torch.multinomial(probs, num_samples=1).squeeze(-1).view(batch_size, -1)   # (1, S)
                 
@@ -874,6 +876,10 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
                 eos_idx = new_input_ids[0].eq(tokenizer.eos_token_id).nonzero().squeeze(-1)
                 eos_idx = eos_idx[0] + 1 if eos_idx.size(-1) > 0 else max_length
                 new_input_ids = new_input_ids[:, :eos_idx]
+                if new_input_ids.size(-1) > confidence.size(-1):
+                    confidence = torch.cat((confidence, torch.ones_like(new_input_ids[:, confidence.size(-1):]).float()), dim=-1)
+                confidence = confidence[:, :new_input_ids.size(-1)]
+                confidence[0, pred_start_pos: pred_end_pos + 1] = results.values[0].squeeze(-1)[:eos_idx - pred_start_pos]
                 # convergence check
                 min_seq_length = min(new_input_ids.size(-1), input_ids.size(-1))
                 diff_idx = new_input_ids[0, :min_seq_length].ne(input_ids[0, :min_seq_length]).nonzero().squeeze(-1)
@@ -897,6 +903,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
                             past_key_values.value_cache[i] = past_key_values.value_cache[i][..., :fixed_seq_length, :]
                 if start_idx >= eos_idx or len(tracks) > max_iter_times:
                     keep_generate = False
+                    input_ids = new_input_ids
                     break
                 
                 # update position_ids, attention_mask, position_ids_to_predict
@@ -926,6 +933,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
                 return tracks, input_ids
             weights = get_normal_dist(forward_size=forward_size, backward_size=backward_size).to(input_ids.device)
             new_input_ids = input_ids
+            confidence = torch.ones_like(new_input_ids[:, :eos_idx]).float()
         
         tracks.append([None, None])
         
@@ -966,10 +974,10 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
                 for j in range(logits.size(1)):
                     cur_positions_indexes = ref_position_ids_to_predict[i][j].ge(seq_length).nonzero().squeeze(-1)  # get corresponding predicted positions
                     if cur_positions_indexes.size(-1) <= 0: continue
-                    weighted_logits = logits[i, j, cur_positions_indexes] * weights[cur_positions_indexes].unsqueeze(-1)
+                    weighted_logits = logits[i, j, cur_positions_indexes] * (weights[cur_positions_indexes] * confidence[i, seq_length - 1 + j]).unsqueeze(-1)
                     cur_positions = ref_position_ids_to_predict[i, j, cur_positions_indexes]
                     tmp_logits[i, cur_positions - seq_length] = tmp_logits[i, cur_positions - seq_length] + weighted_logits
-                    tmp_weights[i, cur_positions - seq_length] = tmp_weights[i, cur_positions - seq_length] + weights[cur_positions_indexes]
+                    tmp_weights[i, cur_positions - seq_length] = tmp_weights[i, cur_positions - seq_length] + weights[cur_positions_indexes] * confidence[i, seq_length - 1 + j]
             tmp_weights = tmp_weights.eq(0).float() + tmp_weights
             logits = tmp_logits / tmp_weights.unsqueeze(-1)    # (1, S, V)
             
@@ -977,7 +985,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
             token_scores = processors(input_ids, logits.view(-1, logits.size(-1)))  # (1 * S, V)
             token_scores = warpers(input_ids, token_scores)  # (1 * S, V)
             probs = nn.functional.softmax(token_scores, dim=-1)  # (1 * S, V)
-            # results = torch.topk(nn.functional.softmax(logits, dim=-1), k=topk, dim=-1)
+            results = torch.topk(nn.functional.softmax(logits, dim=-1), k=1, dim=-1)
             # sample and get candidate tokens
             tokens = torch.multinomial(probs, num_samples=1).squeeze(-1).view(batch_size, -1)   # (1, S)
             
@@ -994,6 +1002,10 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
             eos_idx = new_input_ids[0].eq(tokenizer.eos_token_id).nonzero().squeeze(-1)
             eos_idx = eos_idx[0] + 1 if eos_idx.size(-1) > 0 else max_length
             new_input_ids = new_input_ids[:, :eos_idx]
+            if new_input_ids.size(-1) > confidence.size(-1):
+                confidence = torch.cat((confidence, torch.ones_like(new_input_ids[:, confidence.size(-1):]).float()), dim=-1)
+            confidence = confidence[:, :new_input_ids.size(-1)]
+            confidence[0, seq_length: pred_end_pos + 1] = results.values[0].squeeze(-1)[:eos_idx - seq_length]
             # convergence check
             min_seq_length = min(new_input_ids.size(-1), input_ids.size(-1))
             diff_idx = new_input_ids[0, :min_seq_length].ne(input_ids[0, :min_seq_length]).nonzero().squeeze(-1)

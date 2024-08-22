@@ -443,7 +443,8 @@ def replace_with_zero_one(topk_probs: torch.FloatTensor):
     batch_size, k = topk_probs.size(0), topk_probs.size(-1)
     topk_probs = topk_probs.view(-1, k).contiguous()
     random_noise = torch.rand(topk_probs.size(0), device=topk_probs.device)
-    to_replace_ids = random_noise.le(.5).nonzero().squeeze(-1)
+    # to_replace_ids = random_noise.le(.5).nonzero().squeeze(-1)
+    to_replace_ids = random_noise.le(1.0).nonzero().squeeze(-1)
     if to_replace_ids.size(-1) > 0:
         selected_indexes = torch.randint(k, (to_replace_ids.size(-1),)).to(topk_probs.device)
         new_probs = torch.zeros_like(topk_probs[to_replace_ids], dtype=torch.float)
@@ -453,7 +454,23 @@ def replace_with_zero_one(topk_probs: torch.FloatTensor):
     return topk_probs.view(batch_size, -1, k).contiguous()
 
 
-def get_normal_dist(mean=0.0, std=1.0, forward_size=4, backward_size=4, r=1):
+# def get_normal_dist(mean=0.0, std=1.0, forward_size=4, backward_size=4, r=1):
+#     import torch.distributions as distr
+    
+#     mean = torch.tensor([mean])
+#     std = torch.tensor([std])
+#     normal = distr.Normal(mean, std)
+
+#     # Calculate probability density function (PDF)
+#     window_size = max(forward_size, backward_size)
+#     x = torch.linspace(-r, r, window_size * 2 + 1)
+#     x = torch.exp(normal.log_prob(x))
+    
+#     mid_idx = len(x) // 2
+#     return x[mid_idx - backward_size: mid_idx + forward_size + 1]
+
+
+def get_normal_dist(mean=0.0, std=1.0, forward_size=4, backward_size=4, r=3):
     import torch.distributions as distr
     
     mean = torch.tensor([mean])
@@ -462,9 +479,9 @@ def get_normal_dist(mean=0.0, std=1.0, forward_size=4, backward_size=4, r=1):
 
     # Calculate probability density function (PDF)
     window_size = max(forward_size, backward_size)
-    x = torch.linspace(-r, r, window_size * 2 + 1)
+    x = torch.linspace(-r, r, (window_size + 1) * 2 + 1)
     x = torch.exp(normal.log_prob(x))
     
     mid_idx = len(x) // 2
-    return x[mid_idx - backward_size: mid_idx + forward_size + 1]
+    return x[mid_idx - backward_size - 1: mid_idx + forward_size]
     
