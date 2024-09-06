@@ -1,17 +1,3 @@
-# Copyright 2023-2024 PKU-Alignment Team. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
 """Miscellaneous utilities."""
 
 from __future__ import annotations
@@ -21,6 +7,7 @@ import os
 import random
 import json
 import codecs
+import jsonlines
 import threading
 from collections import OrderedDict
 from typing import Any, Callable, Generator, TypeVar, cast
@@ -38,6 +25,7 @@ import torch.nn.functional as F
 from optree.typing import PyTreeTypeVar
 from transformers import PreTrainedTokenizerBase
 from transformers.modeling_outputs import ModelOutput
+from transformers.generation.utils import LogitsProcessorList
 from transformers.tokenization_utils import BatchEncoding, PaddingStrategy, TruncationStrategy
 
 from oa_dag.configs.constants import PROMPT_ASSISTANT, IGNORE_INDEX
@@ -63,6 +51,12 @@ Func = TypeVar('Func', bound=Callable[..., Any])
 
 json_load = lambda x: json.load(codecs.open(x, 'r', encoding='utf-8'))
 json_dump = lambda d, p: json.dump(d, codecs.open(p, 'w', 'utf-8'), indent=2, ensure_ascii=False)
+
+
+def jsonlines_load(x):
+    with jsonlines.open(x, mode='r') as reader:
+        data = [r for r in reader]
+    return data
 
 
 def seed_everything(seed: int) -> None:
@@ -337,27 +331,6 @@ def pad_tensors(tensors, max_len=-1, pad_value=IGNORE_INDEX):
 
 
 def shuffle_and_mask(label_position_ids: torch.LongTensor, ratio_generator, left2right=False, fixed_mask_threshold=-1, device=None):
-    # keep_sample = True
-    # while keep_sample:
-    #     if fixed_mask_threshold >= 0:
-    #         mask_threshold = fixed_mask_threshold
-    #     else:
-    #         # sample to get masking threshold
-    #         mask_threshold = ratio_generator.rvs(1)[0]
-        
-    #     if left2right:  # mask the right part
-    #         random_noise = torch.arange(0, label_position_ids.size(-1), dtype=torch.float, device=device)
-    #         random_noise = (-random_noise + label_position_ids.size(-1) - 0.5) / label_position_ids.size(-1)    # reverse to be descending
-    #     else:   # randomly mask
-    #         random_noise = torch.rand(label_position_ids.size(-1), device=device)
-        
-    #     # extract the position ids of the tokens to mask
-    #     mask_label_position_ids = label_position_ids[random_noise.lt(mask_threshold).nonzero().squeeze(-1)]
-    #     if mask_label_position_ids.size(0) > 0 or label_position_ids.size(0) <= 0:
-    #         keep_sample = False
-    
-    # return mask_label_position_ids, mask_threshold
-    
     if fixed_mask_threshold >= 0:
         mask_threshold = fixed_mask_threshold
     else:
@@ -386,7 +359,7 @@ def add_noise(cur_input_ids: torch.LongTensor, cur_labels: torch.LongTensor, rat
             replace_threshold = ratio_generator.rvs(1)[0]
         random_noise = torch.rand(cur_input_ids.size(-1), device=device)
         replace_ids = torch.logical_and(random_noise.lt(replace_threshold), cur_labels.ne(IGNORE_INDEX)).nonzero().squeeze(-1)
-        if not force_replace or fixed_replace_threshold >= 0 or replace_ids.size(-1) > 0:
+        if not force_replace or replace_ids.size(-1) > 0:
             keep_generate = False
     return replace_ids, replace_threshold
 
@@ -453,23 +426,6 @@ def replace_with_zero_one(topk_probs: torch.FloatTensor):
         topk_probs[to_replace_ids] = new_probs
     return topk_probs.view(batch_size, -1, k).contiguous()
 
-
-# def get_normal_dist(mean=0.0, std=1.0, forward_size=4, backward_size=4, r=1):
-#     import torch.distributions as distr
-    
-#     mean = torch.tensor([mean])
-#     std = torch.tensor([std])
-#     normal = distr.Normal(mean, std)
-
-#     # Calculate probability density function (PDF)
-#     window_size = max(forward_size, backward_size)
-#     x = torch.linspace(-r, r, window_size * 2 + 1)
-#     x = torch.exp(normal.log_prob(x))
-    
-#     mid_idx = len(x) // 2
-#     return x[mid_idx - backward_size: mid_idx + forward_size + 1]
-
-
 def get_normal_dist(mean=0.0, std=1.0, forward_size=4, backward_size=4, r=3):
     import torch.distributions as distr
     
@@ -478,10 +434,285 @@ def get_normal_dist(mean=0.0, std=1.0, forward_size=4, backward_size=4, r=3):
     normal = distr.Normal(mean, std)
 
     # Calculate probability density function (PDF)
-    window_size = max(forward_size, backward_size)
-    x = torch.linspace(-r, r, (window_size + 1) * 2 + 1)
+    # window_size = max(forward_size, backward_size) * 2
+    window_size = forward_size + backward_size
+    # x = torch.linspace(-r, r, window_size + 1)
+    x = torch.linspace(0, 2 * r, window_size + 1)
     x = torch.exp(normal.log_prob(x))
     
-    mid_idx = len(x) // 2
-    return x[mid_idx - backward_size - 1: mid_idx + forward_size]
+    # x = torch.tensor([0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.08, 2e-05, 0.125, 2e-05, 2e-05, 2e-05])
     
+    # mid_idx = len(x) // 2
+    # return x[mid_idx - backward_size - 1: mid_idx + forward_size]
+    return x
+
+
+def sample_from_dataset(dataset, maxlen):
+    maxlen = min(maxlen, len(dataset))
+    return random.sample(list(dataset), maxlen)
+
+
+def get_hyperbolic_dist(forward_size=4, backward_size=8):
+    def hyperbolic_distance(x, scale=1):
+        return torch.arccosh(1 + ((x - 1) * scale) ** 2 / 2)
+        
+    x_forward = torch.arange(0, forward_size) + 1
+    x_forward = hyperbolic_distance(x_forward, scale=1e16)
+
+    x_backward = -torch.arange(0, backward_size + 1) + backward_size
+    x_backward[-1] = 1
+    x_backward = hyperbolic_distance(x_backward, scale=1e8) #* x_forward[1]
+
+    x_max = x_forward.max().item() + 1
+    x_forward = (-x_forward + x_max) / x_max
+    x_backward = (-x_backward + x_max) / x_max
+
+    x = torch.cat((x_backward, x_forward), dim=-1)
+    x[backward_size] = 0
+    x[backward_size] = x.mean()
+    # x[backward_size] = x_forward[1]
+    return x
+
+def kl_divergence_log(log_p, log_q):
+    if log_q.eq(0).all():
+        return torch.zeros_like(log_p[0]) + torch.inf
+    if (log_p - log_q).abs().max() < 1e-3:
+        return torch.zeros_like(log_p[0])
+    # This function calculates KL divergence in log space
+    p = torch.exp(log_p)
+    rst = torch.sum(p * (log_p - log_q), dim=-1)
+    if rst < 0 and rst.abs() < 1e-3:
+        return torch.zeros_like(log_p[0]) + rst.abs()
+    return rst
+
+def js_divergence_log(log_p, log_q):
+    # Calculate the mean distribution in log space
+    log_m = torch.log((torch.exp(log_p) + torch.exp(log_q)) / 2)
+    return (kl_divergence_log(log_p, log_m) + kl_divergence_log(log_q, log_m)) / 2
+
+def calculate_jsd_variance_log(distributions_log, mean_distribution_log, weights):
+    if not len(distributions_log):
+        return torch.zeros_like(mean_distribution_log[0]) + torch.inf
+    
+    # Calculate the JSD for each distribution against the mean distribution
+    jsd_values = [js_divergence_log(log_dist, mean_distribution_log) * weight for log_dist, weight in zip(distributions_log, weights)]
+    
+    # Calculate the "variance" as the mean of these JSD values
+    jsd_variance = torch.sum(torch.stack(jsd_values)) / weights.sum()
+    
+    return jsd_variance
+
+
+def calculate_kl_variance_log(distributions_log, mean_distribution_log, weights):
+    if not len(distributions_log):
+        return torch.zeros_like(mean_distribution_log[0]) + torch.inf
+    
+    # Calculate the KLD for each distribution against the mean distribution
+    kl_values = [kl_divergence_log(log_dist, mean_distribution_log) * weight for log_dist, weight in zip(distributions_log, weights)]
+    
+    # Calculate the "variance" as the mean of these JSD values
+    jsd_variance = torch.sum(torch.stack(kl_values)) / weights.sum()
+    
+    return jsd_variance
+
+
+def gather_kl_variance_dict(logprobs_dict: torch.FloatTensor, mean_logprobs: torch.FloatTensor, weights: torch.FloatTensor):
+    batch_size, n_tokens = mean_logprobs.size(0), mean_logprobs.size(1)
+    variance_logprobs = torch.zeros(batch_size, n_tokens, dtype=mean_logprobs.dtype, device=mean_logprobs.device)
+    n_logprobs = torch.zeros(batch_size, n_tokens, dtype=torch.int8, device=mean_logprobs.device)
+    for i in range(batch_size):
+        for j in range(n_tokens):
+            logprobs_list = [x for k, x in enumerate(logprobs_dict[i, j]) if x.ne(0).any()]
+            variance_logprobs[i, j] = calculate_kl_variance_log(
+                logprobs_list, mean_logprobs[i, j],
+                weights[logprobs_dict[i, j].ne(0).any(-1).nonzero().squeeze(-1)][:len(logprobs_list)]
+            )
+            n_logprobs[i, j] = len(logprobs_list)
+    return variance_logprobs, n_logprobs
+
+
+def extract_logprobs_into_dict(
+    input_ids: torch.LongTensor,
+    logits: torch.FloatTensor, 
+    ref_position_ids_to_predict: torch.LongTensor,
+    pred_start_pos: int, 
+    pred_end_pos: int, 
+    weights: torch.FloatTensor,
+    processors: LogitsProcessorList,
+    forward_size: int = 4,
+    backward_size: int = 8,
+):
+    batch_size = input_ids.size(0)
+    next_token_weights = torch.zeros_like(weights)
+    next_token_weights[backward_size + 1] = 1
+    
+    # extract scores from logits
+    token_scores = processors(input_ids, logits.view(-1, logits.size(-1)))  # (1 * S, V)
+    logprobs = nn.functional.log_softmax(token_scores, dim=-1).view(logits.size(1), -1, logits.size(-1)).unsqueeze(0)    # (1 * S, V) --> (1, L', N, V)
+    n_hidden_states = logprobs.size(1)
+    
+    cur_weights = torch.zeros(batch_size, pred_end_pos - pred_start_pos + 1, dtype=logprobs.dtype, device=logprobs.device)  # (1, T)
+    ensemble_logprobs = torch.zeros(batch_size, pred_end_pos - pred_start_pos + 1, logprobs.size(-1), dtype=logprobs.dtype, device=logprobs.device)  # (1, T, V)
+    next_token_logprobs = torch.zeros(batch_size, pred_end_pos - pred_start_pos + 1, logprobs.size(-1), dtype=logprobs.dtype, device=logprobs.device)  # (1, T, V)
+    logprobs_dict = torch.zeros(batch_size, pred_end_pos - pred_start_pos + 1, forward_size + backward_size + 1, logprobs.size(-1), dtype=logprobs.dtype, device=logprobs.device)  # (1, T, V)
+    
+    for i in range(batch_size):
+        for j in range(n_hidden_states):
+            # get corresponding predicted positions
+            cur_positions_indexes = ref_position_ids_to_predict[i, j].ge(pred_start_pos).nonzero().squeeze(-1)
+            if cur_positions_indexes.size(-1) <= 0: continue
+            cur_positions = ref_position_ids_to_predict[i, j, cur_positions_indexes]
+            
+            # logprobs dict
+            for k, dis in enumerate(cur_positions_indexes):
+                logprobs_dict[i, (cur_positions - pred_start_pos)[k], dis] = logprobs[i, j, cur_positions_indexes][k]
+            
+            # weighted sum
+            weight = weights[cur_positions_indexes]
+            weighted_logprobs = logprobs[i, j, cur_positions_indexes] * weight.unsqueeze(-1)
+            ensemble_logprobs[i, cur_positions - pred_start_pos] = ensemble_logprobs[i, cur_positions - pred_start_pos] + weighted_logprobs
+            next_token_logprobs[i, cur_positions - pred_start_pos] = next_token_logprobs[i, cur_positions - pred_start_pos] + logprobs[i, j, cur_positions_indexes] * next_token_weights[cur_positions_indexes].unsqueeze(-1)
+            cur_weights[i, cur_positions - pred_start_pos] = cur_weights[i, cur_positions - pred_start_pos] + weight
+    
+    cur_weights = cur_weights.eq(0).float() + cur_weights
+    ensemble_logits = ensemble_logprobs / cur_weights.unsqueeze(-1)
+    ensemble_logprobs = ensemble_logits.log_softmax(dim=-1)    # (1, S, V)
+    
+    return logprobs_dict, ensemble_logprobs, next_token_logprobs, ensemble_logits
+
+
+def create_tree_attention_mask(logprobs: torch.FloatTensor, topk: int = 16, maximum_combs: int = 16, maximum_seq_len: int = 100):
+    n_depth = logprobs.size(0)
+    results = torch.topk(logprobs.view(-1, logprobs.size(-1)), k=topk, dim=-1)
+    topk = results.values.size(-1)
+    positions = torch.arange(0, n_depth, dtype=torch.long, device=logprobs.device).unsqueeze(-1).expand(n_depth, topk)
+    topk_indexes = torch.arange(0, topk, dtype=torch.long, device=logprobs.device).unsqueeze(0).expand(n_depth, topk)
+    
+    confidence = results.values.exp().view(-1)
+    sorted_conf = confidence.sort(descending=True)
+    positions, topk_indexes = positions.contiguous().view(-1), topk_indexes.contiguous().view(-1)
+    
+    combinations = [[0 for _ in range(n_depth)]]
+    initial_indexes = [i * topk for i in range(n_depth)]
+    nest_combinations = []
+    for i in range(1, len(combinations[0])):
+        if combinations[0][:i] not in nest_combinations:
+            nest_combinations.append(combinations[0][:i])
+    for idx in sorted_conf.indices:
+        if idx in initial_indexes: continue
+        pos, k = positions[idx], topk_indexes[idx]
+        tmp_combinations = []
+        for comb in combinations:
+            comb = comb[:]
+            comb[pos] = k.item()
+            for i in range(pos + 1, len(comb)):
+                if comb[:i] not in nest_combinations:
+                    nest_combinations.append(comb[:i])
+            tmp_combinations.append(comb)
+        combinations.extend(tmp_combinations)
+        if len(combinations) + len(nest_combinations) > maximum_seq_len:
+            break
+    combinations = combinations + nest_combinations
+    
+    # Sort the combinations based on their lengths and then their values
+    sorted_combinations = sorted(combinations, key=lambda x: (len(x), x))
+    comb_len = len(sorted_combinations) + 1
+    # Initialize depth_counts to keep track of how many choices have a particular depth
+    seq_ids = []
+    depth_counts, prev_depth = [], 0
+    for path in sorted_combinations:
+        depth = len(path)
+        if depth != prev_depth:
+            depth_counts.append(0)
+        depth_counts[depth - 1] += 1
+        prev_depth = depth
+        seq_ids.append(results.indices[len(path) - 1, path[-1]])
+    seq_ids = torch.stack(seq_ids, dim=0)
+    # Create the attention mask
+    tree_attn_mask = torch.eye(comb_len, comb_len)
+    tree_attn_mask[:, 0] = 1
+    start = 0
+    for i in range(len(depth_counts)):
+        for j in range(depth_counts[i]):
+            cur_choice = sorted_combinations[start + j]
+            # retrieve ancestor position
+            if len(cur_choice) == 1: continue
+            ancestor_idx = []
+            for c in range(len(cur_choice) - 1):
+                ancestor_idx.append(sorted_combinations.index(cur_choice[:c+1]) + 1)
+            tree_attn_mask[j + start + 1, ancestor_idx] = 1
+        start += depth_counts[i]
+    
+    # Generate position IDs
+    position_ids = torch.zeros(comb_len, dtype=torch.long)
+    start = 0
+    for i in range(len(depth_counts)):
+        position_ids[start + 1: start + depth_counts[i] + 1] = i + 1
+        start += depth_counts[i]
+    
+    # Generate retrieval indices
+    retrieve_indices_nest = []
+    retrieve_paths = []
+    for i in range(len(sorted_combinations)):
+        cur_choice = sorted_combinations[-i-1]
+        retrieve_indice = []
+        if cur_choice in retrieve_paths:
+            continue
+        else:
+            for c in range(len(cur_choice)):
+                retrieve_indice.append(sorted_combinations.index(cur_choice[:c+1]))
+                retrieve_paths.append(cur_choice[:c+1])
+        retrieve_indices_nest.append(retrieve_indice)
+    max_length = max([len(x) for x in retrieve_indices_nest])
+    retrieve_indices = [pad_path(path, max_length) for path in retrieve_indices_nest]
+    retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long)
+    retrieve_indices = retrieve_indices + 1
+    retrieve_indices = torch.cat([torch.zeros((retrieve_indices.shape[0], 1), dtype=torch.long), retrieve_indices], dim=1)
+    
+    return seq_ids, position_ids.to(seq_ids.device), tree_attn_mask.bool().to(seq_ids.device), retrieve_indices.to(seq_ids.device)
+
+
+def prepare_candidate_input_output(
+    prev_input_ids: torch.LongTensor, 
+    candidate_ids: torch.LongTensor, 
+    candidate_position_ids: torch.LongTensor,
+    tree_attn_mask: torch.BoolTensor,
+):
+    cur_input_ids = torch.cat((prev_input_ids, candidate_ids), dim=-1)
+    prev_position_ids = torch.arange(0, prev_input_ids.size(-1), dtype=torch.long, device=prev_input_ids.device)
+    cur_position_ids = torch.cat((prev_position_ids, candidate_position_ids[1:] + prev_position_ids[-1] - 1), dim=-1)
+    cur_position_ids_to_predict = (cur_position_ids + 1).unsqueeze(-1)
+    # cur_position_ids_to_predict = torch.stack((cur_position_ids, cur_position_ids + 1), dim=-1)
+    # cur_position_ids_to_predict = torch.stack((cur_position_ids, cur_position_ids + 1, cur_position_ids + 1), dim=-1)
+    
+    cur_attention_mask = torch.tril(torch.ones((cur_input_ids.size(-1), cur_input_ids.size(-1)))).bool().to(cur_input_ids.device)
+    cur_attention_mask[-candidate_ids.size(-1) - 1:, -candidate_ids.size(-1) - 1:] = tree_attn_mask
+    
+    return cur_input_ids, cur_position_ids, cur_attention_mask, cur_position_ids_to_predict
+
+
+def pad_path(path, length, pad_value=-2):
+    """
+    Pad the given path list with a specific value up to a specified length.
+    
+    Parameters:
+    - path (list): The original list that needs padding.
+    - length (int): The desired length of the padded list.
+    - pad_value (optional, default=-2): The value to use for padding.
+    
+    Returns:
+    - list: A new list based on the original path but padded to the desired length.
+    
+    Example:
+    >>> pad_path([1,2,3], 5)
+    [1, 2, 3, -2, -2]
+    
+    Note:
+    If the given path is already longer than the specified length, 
+    then no padding occurs, and the original path is returned.
+    """
+    
+    # Calculate the number of padding values needed by subtracting the length
+    # of the path from the desired length.
+    # Append the padding values to the original path and return the new list.
+    return path + [pad_value] * (length - len(path))

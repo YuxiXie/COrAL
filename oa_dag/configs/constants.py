@@ -49,6 +49,16 @@ PROMPT_DICTS: dict[str, dict[str, str]] = {
         'prompt_user': '### Instruction:\n{input}\n\n',
         'prompt_assistant': '### Response:'
     },
+    'llama3-instruct': {
+        'prompt_begin': '<|start_header_id|>system<|end_header_id|>\n\nBelow is an instruction that describes a task. Write a response that appropriately completes the request.<|eot_id|>',
+        'prompt_user': '<|start_header_id|>user<|end_header_id|>\n\n{input}<|eot_id|>',
+        'prompt_assistant': '<|start_header_id|>assistant<|end_header_id|>\n\n'
+    },
+    'tulu': {
+        'prompt_begin': 'Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n',
+        'prompt_user': '<|user|>\n{input}\n',
+        'prompt_assistant': '<|assistant|>\n'
+    }
 }
 
 ADAM_BETAS: tuple[float, float] = (0.9, 0.95)

@@ -55,9 +55,13 @@ class SupervisedDataset(TokenizedDataset):
             input = raw_sample['input']  # pylint: disable=redefined-builtin
             if not isinstance(input, str):
                 raise ValueError(f'Unsupported type of `input`: {type(input)}. Expected: str.')
-            prompt = format_prompt(input=input, eos_token=self.tokenizer.eos_token, model_type=self.model_type)
+            prompt = format_prompt(input=input, eos_token='<|eot_id|>' if self.model_type == 'llama3-instruct' else self.tokenizer.eos_token, 
+                                   model_type=self.model_type)
             answer = raw_sample['answer']
-            text = prompt + answer + self.tokenizer.eos_token
+            if self.model_type == 'llama3-instruct':
+                text = prompt + answer + '<|eot_id|>' + self.tokenizer.eos_token
+            else:
+                text = prompt + answer + self.tokenizer.eos_token
 
             input_ids = self.tokenize(text)
             labels = input_ids.clone()
@@ -80,7 +84,12 @@ class SupervisedDataset(TokenizedDataset):
                 text += prompt_user.format(input=line) + prompt_assistant
             else:
                 # Assistant input
-                text += line + self.tokenizer.eos_token
+                if self.model_type == 'llama3-instruct':
+                    text += line + '<|eot_id|>'
+                else:
+                    text += line + self.tokenizer.eos_token
+            if self.model_type == 'llama3-instruct' and i == len(dialogue):
+                text += self.tokenizer.eos_token
             input_ids = self.tokenize(text)
             offsets.append(len(input_ids))
 

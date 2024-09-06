@@ -83,7 +83,22 @@ def parse_arguments() -> argparse.Namespace:
     # Training
     training_parser = parser.add_argument_group('training')
     training_parser.add_argument(
+        '--sample_to_replace',
+        default=False,
+        action='store_true',
+    )
+    training_parser.add_argument(
+        '--no_noise_coef',
+        default=1,
+        type=float,
+    )
+    training_parser.add_argument(
         '--no_noise',
+        default=False,
+        action='store_true',
+    )
+    training_parser.add_argument(
+        '--no_denoise',
         default=False,
         action='store_true',
     )

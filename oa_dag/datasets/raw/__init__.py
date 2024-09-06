@@ -33,6 +33,11 @@ from oa_dag.datasets.raw.safe_rlhf import (
 
 from oa_dag.datasets.raw.diy_distilled import DistrilledDataset, DistrilledDatasetEval
 from oa_dag.datasets.raw.math import MetaMathTrainDataset, MetaMathValidDataset, GSM8KDataset, MATHDataset
+from oa_dag.datasets.raw.reasoning import MagpieTrainDataset
+from oa_dag.datasets.raw.tulu import TuluTrainDataset
+from oa_dag.datasets.raw.cot import CoTTrainDataset
+from oa_dag.datasets.raw.logicot import LogiCoTTrainDataset
+from oa_dag.datasets.raw.strategyqa import SQADataset
 
 
 __all__ = [
@@ -57,4 +62,14 @@ __all__ = [
     'MetaMathValidDataset',
     'GSM8KDataset',
     'MATHDataset',
+    
+    'MagpieTrainDataset',
+    
+    'CoTTrainDataset',
+    
+    'TuluTrainDataset',
+    
+    'LogiCoTTrainDataset',
+    
+    'SQADataset',
 ]

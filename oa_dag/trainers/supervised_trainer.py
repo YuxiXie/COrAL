@@ -34,7 +34,7 @@ from transformers import AutoModelForCausalLM, get_scheduler
 from transformers.integrations.deepspeed import HfDeepSpeedConfig, deepspeed_load_checkpoint
 
 from oa_dag.configs import ADAM_BETAS
-from oa_dag.datasets import TokenizedDataset
+from oa_dag.datasets import TokenizedDataset, DummyDataset
 from oa_dag.models import load_pretrained_models
 from oa_dag.trainers.base import TrainerBase
 from oa_dag.utils import get_optimizer_grouped_parameters, is_main_process, to_device, get_all_reduce_mean
@@ -127,11 +127,20 @@ class SupervisedTrainer(TrainerBase):
             sampler=DistributedSampler(train_dataset, shuffle=True, drop_last=True),
             batch_size=self.args.per_device_train_batch_size,
         )
+        if self.args.no_noise:
+            self.no_noise_train_dataloader = DataLoader(
+                train_dataset,
+                collate_fn=train_dataset.get_collator(),
+                sampler=DistributedSampler(train_dataset, shuffle=True, drop_last=True, seed=self.args.seed + 1),
+                batch_size=self.args.per_device_train_batch_size,
+            )
+        else:
+            self.no_noise_train_dataloader = DataLoader(DummyDataset(len(self.train_dataloader)))
 
     def init_engines(self) -> None:
         """Initialize DeepSpeed engines."""
         self.args.total_training_steps = len(self.train_dataloader) * self.args.epochs
-        if self.args.no_noise:
+        if self.args.no_noise and not self.args.no_denoise:
             self.args.gradient_accumulation_steps *= 2
             self.ds_config['train_batch_size'] *= 2
             self.ds_config['gradient_accumulation_steps'] *= 2
@@ -208,7 +217,7 @@ class SupervisedTrainer(TrainerBase):
         
         steps_trained_in_current_epoch, epochs_trained = 0, 0
         if self.args.resume_from_ckpt is not None:
-            steps_trained_in_current_epoch = self.model.global_steps * self.args.gradient_accumulation_steps
+            steps_trained_in_current_epoch = self.model.global_steps * self.args.gradient_accumulation_steps // (2 if self.args.no_noise and not self.args.no_denoise else 1)
             if steps_trained_in_current_epoch > 0:
                 progress_bar.update(steps_trained_in_current_epoch)
             self.global_step = steps_trained_in_current_epoch
@@ -228,7 +237,7 @@ class SupervisedTrainer(TrainerBase):
             self.train_dataloader.sampler.set_epoch(epoch)
             if epoch < epochs_trained: continue
 
-            for batch in self.train_dataloader:
+            for batch, no_noise_batch in zip(self.train_dataloader, self.no_noise_train_dataloader):
                 if steps_trained_in_current_epoch > 0:
                     steps_trained_in_current_epoch -= 1
                     continue
@@ -236,20 +245,24 @@ class SupervisedTrainer(TrainerBase):
                 ##=== generate batch (with noise) ===##
                 self.set_eval()
                 if self.args.no_noise:
-                    oa_batch = self.create_oa_batch(to_device(batch, self.args.device), force_replace=True)
-                    torch.cuda.empty_cache()
-                    noa_batch = self.create_oa_batch(to_device(batch, self.args.device), fixed_replace_threshold=0.0)
+                    if not self.args.no_denoise:
+                        oa_batch = self.create_oa_batch(to_device(batch, self.args.device), force_replace=True)
+                        # torch.cuda.empty_cache()
+                    noa_batch = self.create_oa_batch(to_device(no_noise_batch, self.args.device), fixed_replace_threshold=0.0)
                 else:
                     oa_batch = self.create_oa_batch(to_device(batch, self.args.device))
-                torch.cuda.empty_cache()
+                # torch.cuda.empty_cache()
                 
                 ##=== training ===##
                 self.set_train()
-                info = self.train_step(**oa_batch)
-                torch.cuda.empty_cache()
+                if not self.args.no_denoise:
+                    info = self.train_step(**oa_batch)
+                    # torch.cuda.empty_cache()
                 if self.args.no_noise:
                     noa_info = self.train_step(**noa_batch)
-                    torch.cuda.empty_cache()
+                    # torch.cuda.empty_cache()
+                    if self.args.no_denoise:
+                        info = noa_info
                 get_accelerator().empty_cache()
 
                 self.global_step += 1

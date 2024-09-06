@@ -99,6 +99,11 @@ def parse_arguments() -> argparse.Namespace:
         action='store_true',
     )
     training_parser.add_argument(
+        '--no_denoise',
+        default=False,
+        action='store_true',
+    )
+    training_parser.add_argument(
         '--left2right',
         default=False,
         action='store_true',

@@ -14,6 +14,7 @@ import torch
 from torch.nn import Module, CrossEntropyLoss
 import torch.nn.functional as F
 import torch.distributed as dist
+from transformers.generation.utils import LogitsProcessorList, TemperatureLogitsWarper, TopKLogitsWarper
 
 from oa_dag.configs.constants import IGNORE_INDEX
 from oa_dag.datasets import SupervisedDataset, PromptOnlyDataset
@@ -48,6 +49,10 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         self.forward_context_window = self.args.context_window
         self.backward_context_window = int(self.forward_context_window * self.args.n_back_pred)
         self.replace_ratio_generator = get_variable_generator(self.args.replace_ratio_mu, self.args.replace_ratio_std, self.args.replace_ratio_min, self.args.replace_ratio_max)
+        
+        self.replace_sampler = LogitsProcessorList()
+        self.replace_sampler.append(TopKLogitsWarper(top_k=16))
+        self.replace_sampler.append(TemperatureLogitsWarper(temperature=4.0))
     
     def init_models(self) -> None:
         """Initialize model and tokenizer."""
@@ -61,6 +66,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             self.model.oa_layer.requires_grad_(True)
             if not self.model.additional_layer:
                 self.model.base_model.layers[-1].requires_grad_(True)
+                self.model.base_model.oa_layer.requires_grad_(True)
         self.model.lm_head.requires_grad_(self.args.tune_lm_head)        
     
     @property
@@ -108,20 +114,20 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 max_length=self.args.max_length,
                 tokenizer=self.tokenizer,
                 temperature=self.args.temperature,
-                seq_temperature=self.args.seq_temperature,
+                # seq_temperature=self.args.seq_temperature,
                 block_size=self.args.decoding_block_size,
                 forward_size=self.args.context_window,
                 backward_size=int(self.args.context_window * self.args.n_back_pred),
                 occurance_threshold=self.args.decoding_occurance_threshold,
                 verbal=self.args.verbal_decoding,
                 left2right=self.args.left2right,
-                add_denoising=self.args.add_denoising,
+                # add_denoising=self.args.add_denoising,
             )
             dist.barrier()
             return tracks
         else:
             batch = self.corruption(input_ids=input_ids, labels=labels, attention_mask=attention_mask,
-                                fixed_replace_threshold=self.args.eval_replace_ratio)
+                                    fixed_replace_threshold=self.args.eval_replace_ratio, force_replace=True)
             outputs = self.loss(
                 input_ids=batch['input_ids'],
                 attention_mask=batch['attention_mask'],
@@ -145,12 +151,21 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             relative_positions = batch['position_ids_to_predict'] - batch['position_ids'].unsqueeze(-1)    # (B, L, Wf + Wb + 1)
             small_pos, large_pos = relative_positions.min().item(), relative_positions.max().item()
             loss_dict, count_dict = defaultdict(float), defaultdict(float)
+            # losses_mask = torch.zeros_like(losses, dtype=torch.bool)
+            # for bid in range(batch['replace_indexes'].size(0)):
+            #     replace_indexes = batch['replace_indexes'][bid][batch['replace_indexes'][bid].ge(0).nonzero().squeeze(-1)]
+            #     for i in range(losses_mask[bid].size(0)):
+            #         if batch['position_ids_to_predict'][bid][i].max() <= 0: continue
+            #         for j in range(losses_mask[bid][i].size(0)):
+            #             if batch['position_ids_to_predict'][bid][i][j] in replace_indexes:
+            #                 losses_mask[bid][i][j] = True
+            losses_mask = torch.ones_like(losses, dtype=torch.bool)
             for pid in range(small_pos, large_pos + 1):
-                loss_dict[pid] += (relative_positions.eq(pid) * batch['position_ids_to_predict'].gt(0) * losses).sum().item()
-                count_dict[pid] += (relative_positions.eq(pid) * batch['position_ids_to_predict'].gt(0)).sum().item()
+                loss_dict[pid] += (relative_positions.eq(pid) * batch['position_ids_to_predict'].gt(0) * losses_mask * losses).sum().item()
+                count_dict[pid] += (relative_positions.eq(pid) * batch['position_ids_to_predict'].gt(0) * losses_mask).sum().item()
             
             return {i: (torch.tensor(loss_dict[i], device=self.args.device), 
-                        torch.tensor(count_dict[i], device=self.args.device)) for i in loss_dict}
+                        torch.tensor(count_dict[i], device=self.args.device)) for i in loss_dict if i >= (- self.args.context_window * self.args.n_back_pred)}
     
     def eval(self) -> dict[str, Any]:
         """Evaluate the model on the evaluation dataset."""
@@ -208,11 +223,12 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             import ipdb; ipdb.set_trace()
         else:
             # Gather results from all processes
+            min_key = torch.tensor(min(losses.keys()), device=self.args.device)
             max_key = torch.tensor(max(losses.keys()), device=self.args.device)
             # dist.reduce(max_key, dst=0, op=dist.ReduceOp.MAX)
             dist.barrier()
             
-            for key in range(max_key + 1):
+            for key in range(min_key, max_key + 1):
                 try:
                     losses[key] = torch.stack(losses[key], dim=0).sum()
                     counts[key] = torch.stack(counts[key], dim=0).sum()
@@ -229,7 +245,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             
             # if is_main_process():
             losses = dict(sorted(losses.items(), key=lambda x: x[0]))
-            json_dump(losses, f'{output_dir}/losses_ratio_rpl{self.args.eval_replace_ratio}.json')
+            json_dump(losses, f'{output_dir}/losses_{self.args.result_fname}_rpl{self.args.eval_replace_ratio}.json')
         
         dist.barrier()
         assert False, '''only for evaluation'''
@@ -278,7 +294,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         input_ids: torch.LongTensor,
         attention_mask: torch.BoolTensor,
         replace_position_ids: list[torch.LongTensor],
-        topk: int = 8,
+        topk: int = 16,
         pred_gap: int = 0,
     ) -> torch.FloatTensor:
         batch_size, seq_length = input_ids.size(0), input_ids.size(-1)
@@ -314,6 +330,12 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             logits_to_predict.append(tmp_logits[i, _replace_position_ids] / tmp_cnt[i, _replace_position_ids])
         logits = torch.stack(logits_to_predict, dim=0)
         
+        if self.args.sample_to_replace:
+            probs = self.replace_sampler(input_ids, logits.view(-1, logits.size(-1)))
+            probs = F.softmax(probs, dim=-1)
+            token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1).view(logits.size(0), -1)
+            return None, token_ids
+        
         topk = topk if topk > 0 else self.tokenizer.vocab_size
         results = torch.topk(F.softmax(logits, dim=-1), k=topk, dim=-1)
         return results.values, results.indices
@@ -335,24 +357,24 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         force_replace = force_replace and fixed_replace_threshold < 0
         
         new_input_ids = input_ids.clone()
-        # if force_replace:
-        #     position_ids_to_predict = torch.arange(self.backward_context_window + 1, dtype=torch.long, device=self.args.device)
-        #     position_ids_to_predict = (position_ids_to_predict - self.backward_context_window) + torch.arange(seq_length, dtype=torch.long, device=self.args.device).view(-1, 1)
-        #     position_ids_to_predict = position_ids_to_predict.unsqueeze(0).expand(batch_size, seq_length, self.backward_context_window + 1).contiguous()
-        #     padded_labels = torch.zeros(batch_size, seq_length, self.backward_context_window + 1, dtype=torch.long, device=self.args.device)
-        # else:
-        #     position_ids_to_predict = torch.arange(self.forward_context_window + self.backward_context_window + 1, dtype=torch.long, device=self.args.device)
-        #     position_ids_to_predict = (position_ids_to_predict - self.backward_context_window) + torch.arange(seq_length, dtype=torch.long, device=self.args.device).view(-1, 1)
-        #     position_ids_to_predict = position_ids_to_predict.unsqueeze(0).expand(batch_size, seq_length, self.forward_context_window + self.backward_context_window + 1).contiguous()
-        #     padded_labels = torch.zeros(batch_size, seq_length, self.forward_context_window + self.backward_context_window + 1, dtype=torch.long, device=self.args.device)
-        #     # position_ids_to_predict = torch.arange(self.forward_context_window + 1, dtype=torch.long, device=self.args.device)
-        #     # position_ids_to_predict = (position_ids_to_predict + 0) + torch.arange(seq_length, dtype=torch.long, device=self.args.device).view(-1, 1)
-        #     # position_ids_to_predict = position_ids_to_predict.unsqueeze(0).expand(batch_size, seq_length, self.forward_context_window + 1).contiguous()
-        #     # padded_labels = torch.zeros(batch_size, seq_length, self.forward_context_window + 1, dtype=torch.long, device=self.args.device)
-        position_ids_to_predict = torch.arange(self.forward_context_window + self.backward_context_window + 1, dtype=torch.long, device=self.args.device)
-        position_ids_to_predict = (position_ids_to_predict - self.backward_context_window) + torch.arange(seq_length, dtype=torch.long, device=self.args.device).view(-1, 1)
-        position_ids_to_predict = position_ids_to_predict.unsqueeze(0).expand(batch_size, seq_length, self.forward_context_window + self.backward_context_window + 1).contiguous()
-        padded_labels = torch.zeros(batch_size, seq_length, self.forward_context_window + self.backward_context_window + 1, dtype=torch.long, device=self.args.device)
+        if force_replace:
+            position_ids_to_predict = torch.arange(self.backward_context_window + 1, dtype=torch.long, device=self.args.device)
+            position_ids_to_predict = (position_ids_to_predict - self.backward_context_window) + torch.arange(seq_length, dtype=torch.long, device=self.args.device).view(-1, 1)
+            position_ids_to_predict = position_ids_to_predict.unsqueeze(0).expand(batch_size, seq_length, self.backward_context_window + 1).contiguous()
+            padded_labels = torch.zeros(batch_size, seq_length, self.backward_context_window + 1, dtype=torch.long, device=self.args.device)
+        else:
+            # position_ids_to_predict = torch.arange(self.forward_context_window + self.backward_context_window + 1, dtype=torch.long, device=self.args.device)
+            # position_ids_to_predict = (position_ids_to_predict - self.backward_context_window) + torch.arange(seq_length, dtype=torch.long, device=self.args.device).view(-1, 1)
+            # position_ids_to_predict = position_ids_to_predict.unsqueeze(0).expand(batch_size, seq_length, self.forward_context_window + self.backward_context_window + 1).contiguous()
+            # padded_labels = torch.zeros(batch_size, seq_length, self.forward_context_window + self.backward_context_window + 1, dtype=torch.long, device=self.args.device)
+            position_ids_to_predict = torch.arange(self.forward_context_window, dtype=torch.long, device=self.args.device)
+            position_ids_to_predict = (position_ids_to_predict + 1) + torch.arange(seq_length, dtype=torch.long, device=self.args.device).view(-1, 1)
+            position_ids_to_predict = position_ids_to_predict.unsqueeze(0).expand(batch_size, seq_length, self.forward_context_window).contiguous()
+            padded_labels = torch.zeros(batch_size, seq_length, self.forward_context_window, dtype=torch.long, device=self.args.device)
+        # position_ids_to_predict = torch.arange(self.forward_context_window + self.backward_context_window + 1, dtype=torch.long, device=self.args.device)
+        # position_ids_to_predict = (position_ids_to_predict - self.backward_context_window) + torch.arange(seq_length, dtype=torch.long, device=self.args.device).view(-1, 1)
+        # position_ids_to_predict = position_ids_to_predict.unsqueeze(0).expand(batch_size, seq_length, self.forward_context_window + self.backward_context_window + 1).contiguous()
+        # padded_labels = torch.zeros(batch_size, seq_length, self.forward_context_window + self.backward_context_window + 1, dtype=torch.long, device=self.args.device)
         ##=== adding noise ===##
         for i in range(batch_size):
             ##=== extract label positions ===##
@@ -377,6 +399,10 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             new_input_ids[i] = cur_input_ids
             ##=== wrap for prediction ===##
             position_ids_to_predict[i] = (position_ids_to_predict[i].ge(label_position_ids[0]).float() * position_ids_to_predict[i].le(label_position_ids[-1]).float() * position_ids_to_predict[i]).long()
+            if force_replace and replace_ids.size(-1) > 0:
+                labels_mask = torch.zeros_like(cur_labels, dtype=torch.bool)
+                labels_mask[replace_ids] = True
+                cur_labels = (cur_labels * labels_mask + IGNORE_INDEX * labels_mask.eq(0)).long()
             for j in range(seq_length):
                 padded_labels[i][j] = cur_labels[position_ids_to_predict[i][j]]
             
@@ -387,31 +413,42 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         dist.barrier()
         
         ##=== add noise by weighted embeddings ===##
-        topk_probs, topk_ids = None, None
+        _probs, _ids = None, None
         # training_progress = self.global_step / len(self.train_dataloader) / self.args.epochs if is_training else 0
         # var = torch.rand(1, device=self.args.device)[0]
         # var = get_all_reduce_mean(var)
         # dist.barrier()
         # if replace_count_min > 0 and var < training_progress:
         if replace_count_min > 0:
-            topk_probs, topk_ids = self.collect_noisy_inputs(
+            _probs, _ids = self.collect_noisy_inputs(
                 input_ids,
                 attention_mask,
                 replace_position_ids,
                 pred_gap=self.args.pred_gap,
             )
-            replace_indexes = pad_tensors(replace_indexes, pad_value=-1)
-            topk_probs = replace_with_zero_one(topk_probs)
-        
+            if self.args.sample_to_replace:
+                for i in range(_ids.size(0)):
+                    new_input_ids[i][replace_indexes[i]] = _ids[i, :replace_indexes[i].size(-1)]
+            else:
+                replace_indexes = pad_tensors(replace_indexes, pad_value=-1)
+                _probs = replace_with_zero_one(_probs)
+                # for bid in range(batch_size):
+                #     orig_input_ids = labels[bid].clone()
+                #     for j in range(replace_indexes.size(-1)):
+                #         if replace_indexes[bid][j] < 0: break
+                #         idx = topk_probs[bid][j].max(dim=-1).indices
+                #         orig_input_ids[replace_indexes[bid][j]] = topk_ids[bid][j][idx]
+                #     padded_labels[bid] = orig_input_ids[position_ids_to_predict[bid]]
+                #     import ipdb; ipdb.set_trace()
         return {
             'input_ids': new_input_ids,     # (B, L)
             'labels': padded_labels,        # (B, L, Wf + Wb + 1)
             'attention_mask': attention_mask,      # (B, L)
             'position_ids': raw_position_ids.unsqueeze(0).repeat(batch_size, 1),     # (B, L)
             'position_ids_to_predict': position_ids_to_predict,        # (B, L, Wf + Wb + 1)
-            'topk_probs': topk_probs,
-            'topk_ids': topk_ids,
-            'replace_indexes': replace_indexes if topk_ids is not None else None,
+            'topk_probs': _probs,
+            'topk_ids': _ids,
+            'replace_indexes': replace_indexes if _probs is not None else None,
             'replace_threshold': replace_threshold,
             'replace_ratio': replace_ratio,
         }
@@ -457,9 +494,10 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         
         loss = outputs['loss']
         
-        self.model.backward(loss)
+        coef = 1.0 if replace_ratio > 0 else self.args.no_noise_coef
+        self.model.backward(coef * loss)
         self.model.step()
-        
+        # import ipdb; ipdb.set_trace()
         ############################## sanity check ##############################
         logits = outputs['logits'].detach()
         
