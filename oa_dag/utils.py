@@ -16,6 +16,7 @@ import scipy.stats as stats
 
 import re
 import math
+import time
 import numpy as np
 import optree
 import torch
@@ -452,13 +453,13 @@ def sample_from_dataset(dataset, maxlen):
     return random.sample(list(dataset), maxlen)
 
 
-def get_hyperbolic_dist(forward_size=4, backward_size=8):
+def get_hyperbolic_dist(forward_size=4, backward_size=8, downweight=2e-5):
     def hyperbolic_distance(x, scale=1):
         return torch.arccosh(1 + ((x - 1) * scale) ** 2 / 2)
         
     x_forward = torch.arange(0, forward_size) + 1
     x_forward = hyperbolic_distance(x_forward, scale=1e16)
-
+    
     x_backward = -torch.arange(0, backward_size + 1) + backward_size
     x_backward[-1] = 1
     x_backward = hyperbolic_distance(x_backward, scale=1e8) #* x_forward[1]
@@ -467,11 +468,28 @@ def get_hyperbolic_dist(forward_size=4, backward_size=8):
     x_forward = (-x_forward + x_max) / x_max
     x_backward = (-x_backward + x_max) / x_max
 
+    x_forward[1:] = x_forward[1:] * downweight
+    x_backward[-1] = x_backward[:-1].min() * 1e-1
     x = torch.cat((x_backward, x_forward), dim=-1)
-    x[backward_size] = 0
-    x[backward_size] = x.mean()
-    # x[backward_size] = x_forward[1]
+    
     return x
+
+
+def get_exp_dist(forward_size=4, backward_size=8, forward_scale=8, backward_scale=1/8):
+    x_forward = torch.arange(0, forward_size)
+    x_forward = (-forward_scale * x_forward).exp()
+    
+    if backward_size < 0:
+        return x_forward
+    if backward_size < 1:
+        return torch.cat((x_forward[:1]/10, x_forward), dim=-1)
+    
+    x_backward = -torch.arange(0, backward_size - 1) + backward_size - 2
+    x_backward = torch.cat((x_backward, torch.arange(1, 3)), dim=-1)
+    x_backward = (-backward_scale * x_backward).exp()
+    
+    return torch.cat((x_backward, x_forward), dim=-1)
+
 
 def kl_divergence_log(log_p, log_q):
     if log_q.eq(0).all():
@@ -531,88 +549,88 @@ def gather_kl_variance_dict(logprobs_dict: torch.FloatTensor, mean_logprobs: tor
     return variance_logprobs, n_logprobs
 
 
+def update_variance(logprobs: torch.FloatTensor, available_indexes: torch.LongTensor, window_size: int = 13):
+    n_logprobs = logprobs.size(0)
+    variance = -torch.ones(window_size, window_size, dtype=logprobs.dtype, device=logprobs.device)
+    for i in range(n_logprobs):
+        for j in range(n_logprobs):
+            if i == j:
+                variance[available_indexes[i], available_indexes[j]] = 0
+                continue
+            variance[available_indexes[i], available_indexes[j]] = kl_divergence_log(logprobs[j], logprobs[i])
+    return variance
+
+
 def extract_logprobs_into_dict(
     input_ids: torch.LongTensor,
     logits: torch.FloatTensor, 
     ref_position_ids_to_predict: torch.LongTensor,
     pred_start_pos: int, 
-    pred_end_pos: int, 
-    weights: torch.FloatTensor,
-    processors: LogitsProcessorList,
+    pred_end_pos: int,
     forward_size: int = 4,
     backward_size: int = 8,
 ):
     batch_size = input_ids.size(0)
-    next_token_weights = torch.zeros_like(weights)
-    next_token_weights[backward_size + 1] = 1
+    logprobs = logits.view(-1, logits.size(-1)).log_softmax(dim=-1).view(logits.size(1), -1, logits.size(-1)).unsqueeze(0)    # (1 * S, V) --> (1, L', N, V)
+    windwo_size = forward_size + backward_size + 1
+    target_seq_len = pred_end_pos - pred_start_pos + 1
     
     # extract scores from logits
-    token_scores = processors(input_ids, logits.view(-1, logits.size(-1)))  # (1 * S, V)
-    logprobs = nn.functional.log_softmax(token_scores, dim=-1).view(logits.size(1), -1, logits.size(-1)).unsqueeze(0)    # (1 * S, V) --> (1, L', N, V)
-    n_hidden_states = logprobs.size(1)
-    
-    cur_weights = torch.zeros(batch_size, pred_end_pos - pred_start_pos + 1, dtype=logprobs.dtype, device=logprobs.device)  # (1, T)
-    ensemble_logprobs = torch.zeros(batch_size, pred_end_pos - pred_start_pos + 1, logprobs.size(-1), dtype=logprobs.dtype, device=logprobs.device)  # (1, T, V)
-    next_token_logprobs = torch.zeros(batch_size, pred_end_pos - pred_start_pos + 1, logprobs.size(-1), dtype=logprobs.dtype, device=logprobs.device)  # (1, T, V)
-    logprobs_dict = torch.zeros(batch_size, pred_end_pos - pred_start_pos + 1, forward_size + backward_size + 1, logprobs.size(-1), dtype=logprobs.dtype, device=logprobs.device)  # (1, T, V)
-    
+    logprobs_dict = torch.zeros(batch_size, target_seq_len, windwo_size, logprobs.size(-1), dtype=logprobs.dtype, device=logprobs.device)  # (1, T, V)
+    weights = get_exp_dist(forward_size=forward_size, backward_size=backward_size).to(logprobs.device)
+    weights_dict = torch.zeros(batch_size, target_seq_len, windwo_size, dtype=weights.dtype, device=weights.device)  # (1, T, V)
     for i in range(batch_size):
-        for j in range(n_hidden_states):
-            # get corresponding predicted positions
-            cur_positions_indexes = ref_position_ids_to_predict[i, j].ge(pred_start_pos).nonzero().squeeze(-1)
+        for j in range(windwo_size):
+            cur_positions_indexes = ref_position_ids_to_predict[i, :, j].ge(pred_start_pos).nonzero().squeeze(-1)
             if cur_positions_indexes.size(-1) <= 0: continue
-            cur_positions = ref_position_ids_to_predict[i, j, cur_positions_indexes]
+            cur_positions = ref_position_ids_to_predict[i, cur_positions_indexes, j]
             
-            # logprobs dict
-            for k, dis in enumerate(cur_positions_indexes):
-                logprobs_dict[i, (cur_positions - pred_start_pos)[k], dis] = logprobs[i, j, cur_positions_indexes][k]
-            
-            # weighted sum
-            weight = weights[cur_positions_indexes]
-            weighted_logprobs = logprobs[i, j, cur_positions_indexes] * weight.unsqueeze(-1)
-            ensemble_logprobs[i, cur_positions - pred_start_pos] = ensemble_logprobs[i, cur_positions - pred_start_pos] + weighted_logprobs
-            next_token_logprobs[i, cur_positions - pred_start_pos] = next_token_logprobs[i, cur_positions - pred_start_pos] + logprobs[i, j, cur_positions_indexes] * next_token_weights[cur_positions_indexes].unsqueeze(-1)
-            cur_weights[i, cur_positions - pred_start_pos] = cur_weights[i, cur_positions - pred_start_pos] + weight
+            logprobs_dict[i, cur_positions - pred_start_pos, j] = logprobs[i, cur_positions_indexes, j] * weights[j]
+            weights_dict[i, cur_positions - pred_start_pos, j] = weights[j]
     
-    cur_weights = cur_weights.eq(0).float() + cur_weights
-    ensemble_logits = ensemble_logprobs / cur_weights.unsqueeze(-1)
-    ensemble_logprobs = ensemble_logits.log_softmax(dim=-1)    # (1, S, V)
-    
-    return logprobs_dict, ensemble_logprobs, next_token_logprobs, ensemble_logits
+    ensemble_logits = logprobs_dict.sum(-2) / weights_dict.sum(-1).unsqueeze(-1)
+    return logprobs_dict, ensemble_logits
 
 
-def create_tree_attention_mask(logprobs: torch.FloatTensor, topk: int = 16, maximum_combs: int = 16, maximum_seq_len: int = 100):
+def create_tree_attention_mask(logprobs: torch.FloatTensor, forward_size: int = 1, topk: int = 16, maximum_seq_len: int = 100):
     n_depth = logprobs.size(0)
     results = torch.topk(logprobs.view(-1, logprobs.size(-1)), k=topk, dim=-1)
     topk = results.values.size(-1)
+    
+    # sort tokens by confidence scores
+    confidence = results.values
+    for i in range(forward_size):
+        # scale last few tokens
+        confidence[-i - 1] = confidence[-i - 1] / (forward_size - i)
+    # if n_depth > forward_size:
+        # scale_len = min(n_depth - forward_size, 3)
+        # confidence[:scale_len] = confidence[:scale_len] / max(forward_size - 1, 2)
+        # confidence[0] = confidence[0] / max(forward_size - 1, 2)
+    confidence = confidence.exp().view(-1)
+    sorted_conf = confidence.sort(descending=True)
+    
     positions = torch.arange(0, n_depth, dtype=torch.long, device=logprobs.device).unsqueeze(-1).expand(n_depth, topk)
     topk_indexes = torch.arange(0, topk, dtype=torch.long, device=logprobs.device).unsqueeze(0).expand(n_depth, topk)
-    
-    confidence = results.values.exp().view(-1)
-    sorted_conf = confidence.sort(descending=True)
     positions, topk_indexes = positions.contiguous().view(-1), topk_indexes.contiguous().view(-1)
     
-    combinations = [[0 for _ in range(n_depth)]]
-    initial_indexes = [i * topk for i in range(n_depth)]
-    nest_combinations = []
-    for i in range(1, len(combinations[0])):
-        if combinations[0][:i] not in nest_combinations:
-            nest_combinations.append(combinations[0][:i])
+    # initialize attention tree
+    combinations, nest_combinations = [[0] * n_depth], [[0] * i for i in range(1, n_depth)]
+    total_len = len(combinations) + len(nest_combinations)
+    # expand attention tree
     for idx in sorted_conf.indices:
-        if idx in initial_indexes: continue
-        pos, k = positions[idx], topk_indexes[idx]
+        if idx % topk == 0: continue
+        pos, k = positions[idx].item(), topk_indexes[idx].item()
         tmp_combinations = []
         for comb in combinations:
             comb = comb[:]
-            comb[pos] = k.item()
-            for i in range(pos + 1, len(comb)):
-                if comb[:i] not in nest_combinations:
-                    nest_combinations.append(comb[:i])
+            comb[pos] = k
             tmp_combinations.append(comb)
+            total_len += 1
+            nest_combinations.extend([comb[:i] for i in range(pos + 1, n_depth)])
+            total_len += max(0, n_depth - pos - 1)
         combinations.extend(tmp_combinations)
-        if len(combinations) + len(nest_combinations) > maximum_seq_len:
-            break
-    combinations = combinations + nest_combinations
+        if total_len > maximum_seq_len: break
+    combinations.extend(nest_combinations)
     
     # Sort the combinations based on their lengths and then their values
     sorted_combinations = sorted(combinations, key=lambda x: (len(x), x))
@@ -668,7 +686,8 @@ def create_tree_attention_mask(logprobs: torch.FloatTensor, topk: int = 16, maxi
     retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long)
     retrieve_indices = retrieve_indices + 1
     retrieve_indices = torch.cat([torch.zeros((retrieve_indices.shape[0], 1), dtype=torch.long), retrieve_indices], dim=1)
-    
+    # if seq_ids.size(-1) > 512:
+    #     import ipdb; ipdb.set_trace()
     return seq_ids, position_ids.to(seq_ids.device), tree_attn_mask.bool().to(seq_ids.device), retrieve_indices.to(seq_ids.device)
 
 
@@ -677,13 +696,22 @@ def prepare_candidate_input_output(
     candidate_ids: torch.LongTensor, 
     candidate_position_ids: torch.LongTensor,
     tree_attn_mask: torch.BoolTensor,
+    pred_start_pos: int,
+    pred_end_pos: int,
+    forward_size: int = 4,
+    backward_size: int = 8,
 ):
     cur_input_ids = torch.cat((prev_input_ids, candidate_ids), dim=-1)
     prev_position_ids = torch.arange(0, prev_input_ids.size(-1), dtype=torch.long, device=prev_input_ids.device)
-    cur_position_ids = torch.cat((prev_position_ids, candidate_position_ids[1:] + prev_position_ids[-1] - 1), dim=-1)
-    cur_position_ids_to_predict = (cur_position_ids + 1).unsqueeze(-1)
-    # cur_position_ids_to_predict = torch.stack((cur_position_ids, cur_position_ids + 1), dim=-1)
-    # cur_position_ids_to_predict = torch.stack((cur_position_ids, cur_position_ids + 1, cur_position_ids + 1), dim=-1)
+    cur_position_ids = torch.cat((prev_position_ids, candidate_position_ids[1:] + prev_position_ids[-1]), dim=-1)
+    
+    tmp_position_ids_to_predict = torch.arange(forward_size + backward_size + 1, dtype=torch.long, device=cur_input_ids.device)
+    position_ids_to_predict = (tmp_position_ids_to_predict - backward_size) + torch.arange(cur_position_ids.max().item() + 1, dtype=torch.long, device=cur_input_ids.device).view(-1, 1)
+    position_ids_to_predict = position_ids_to_predict.masked_fill(position_ids_to_predict.lt(pred_start_pos), 0)
+    position_ids_to_predict = position_ids_to_predict.masked_fill(position_ids_to_predict.gt(pred_end_pos), 0)
+    
+    cur_position_ids_to_predict = position_ids_to_predict[cur_position_ids]
+    cur_position_ids_to_predict[:pred_start_pos - 1, :] = 0
     
     cur_attention_mask = torch.tril(torch.ones((cur_input_ids.size(-1), cur_input_ids.size(-1)))).bool().to(cur_input_ids.device)
     cur_attention_mask[-candidate_ids.size(-1) - 1:, -candidate_ids.size(-1) - 1:] = tree_attn_mask
@@ -716,3 +744,118 @@ def pad_path(path, length, pad_value=-2):
     # of the path from the desired length.
     # Append the padding values to the original path and return the new list.
     return path + [pad_value] * (length - len(path))
+
+
+def prepare_candidates(
+    input_ids: torch.LongTensor,
+    logits: torch.FloatTensor,
+    ref_position_ids_to_predict: torch.LongTensor,
+    pred_start_pos: int,
+    pred_end_pos: int,
+    forward_size: int = 4,
+    backward_size: int = 8,
+    eval_forward_size: int = 1,
+    eval_backward_size: int = 8,
+    processors: LogitsProcessorList = LogitsProcessorList(),
+    topk: int = 16,
+    max_new_tokens = 256,
+    max_length: int = 512,
+):
+    # stime = time.time()
+    # aggregate all predicted distributions
+    _, ensemble_logits = extract_logprobs_into_dict(
+        input_ids=input_ids,
+        logits=logits,
+        ref_position_ids_to_predict=ref_position_ids_to_predict,
+        pred_start_pos=pred_start_pos,
+        pred_end_pos=pred_end_pos,
+        forward_size=forward_size,
+        backward_size=backward_size,
+    )
+    
+    # sample and get candidate tokens
+    token_scores = processors(input_ids, ensemble_logits.view(-1, ensemble_logits.size(-1)))  # (1 * T, V)
+    logprobs = nn.functional.log_softmax(token_scores, dim=-1)  # (1 * T, V)
+    # token_scores = greedy_processors(input_ids, token_scores)
+    # tokens = torch.multinomial(token_scores.softmax(-1), num_samples=1).squeeze(-1).unsqueeze(0)
+    # print('[P1-1]', time.time() - stime)
+    
+    # stime = time.time()
+    # tree attention construction
+    max_new_tokens = min(max_new_tokens, max_length - pred_start_pos)
+    candidate_ids, candidate_position_ids, tree_attn_mask, retrieve_indices = \
+        create_tree_attention_mask(
+            logprobs, 
+            topk=topk, 
+            forward_size=forward_size,
+            maximum_seq_len=max_new_tokens,
+        )
+    retrieve_indices = retrieve_indices + input_ids[0, :pred_start_pos].size(-1) - 1
+    # print('[P1-2]', time.time() - stime)
+    
+    # stime = time.time()
+    # tree attention input prepare
+    cur_input_ids, cur_position_ids, cur_attention_mask, cur_position_ids_to_predict = \
+        prepare_candidate_input_output(
+            prev_input_ids=input_ids[0, :pred_start_pos],
+            candidate_ids=candidate_ids,
+            candidate_position_ids=candidate_position_ids,
+            tree_attn_mask=tree_attn_mask,
+            pred_start_pos=pred_start_pos,
+            pred_end_pos=pred_end_pos,
+            forward_size=eval_forward_size,
+            backward_size=eval_backward_size,
+        )
+    # print('[P1-3]', time.time() - stime)
+    
+    return cur_input_ids, cur_position_ids, cur_attention_mask, cur_position_ids_to_predict, retrieve_indices, logprobs
+
+
+def calculate_candidate_losses(
+    cur_input_ids: torch.LongTensor,
+    cur_position_ids_to_predict: torch.LongTensor,
+    candidate_logits: torch.FloatTensor,
+    retrieve_indices: torch.LongTensor,
+    pred_start_pos: int,
+    pred_end_pos: int,
+    forward_size: int = 4,
+    backward_size: int = 8,
+):
+    # stime = time.time()
+    loss_fct = nn.CrossEntropyLoss(reduction='none')
+    shift_logits, shift_labels, candidates = [], [], []
+    for indices in retrieve_indices:
+        shift_logits.append(candidate_logits[indices])
+        labels_i = cur_input_ids[indices].clone()
+        labels_i[0] = IGNORE_INDEX
+        positions_i = cur_position_ids_to_predict[indices] - pred_start_pos + 1
+        positions_i = positions_i.masked_fill(positions_i.lt(1), 0)
+        shift_labels.append(labels_i[positions_i])
+        candidates.append(cur_input_ids[indices][1:])
+    shift_logits, shift_labels = torch.stack(shift_logits, dim=0).view(-1, candidate_logits.size(-1)), torch.stack(shift_labels, dim=0).view(-1)
+    shift_losses = loss_fct(shift_logits, shift_labels).view(retrieve_indices.size(0), retrieve_indices.size(-1), -1)
+    candidates = torch.stack(candidates, dim=0).view(retrieve_indices.size(0), -1)
+    # print('[P2-1]', time.time() - stime)
+    
+    # stime = time.time()
+    batch_size, target_seq_len = retrieve_indices.size(0), retrieve_indices.size(-1) - 1
+    window_size = forward_size + backward_size + 1
+    losses_dict = torch.zeros(batch_size, target_seq_len, window_size, dtype=shift_losses.dtype, device=shift_losses.device)  # (1, T, V)
+    weights = get_exp_dist(forward_size=forward_size, backward_size=backward_size).to(shift_losses.device)
+    weights_dict = torch.zeros(batch_size, target_seq_len, window_size, dtype=weights.dtype, device=weights.device)  # (1, T, V)
+    for i in range(batch_size):
+        shift_losses_i, indices = shift_losses[i], retrieve_indices[i]
+        cur_position_ids_to_predict_i = cur_position_ids_to_predict[indices]
+        for j in range(window_size):
+            cur_positions_indexes = cur_position_ids_to_predict_i[:, j].ge(pred_start_pos).nonzero().squeeze(-1)
+            if cur_positions_indexes.size(-1) <= 0: continue
+            cur_positions = cur_position_ids_to_predict_i[cur_positions_indexes, j]
+            
+            losses_dict[i, cur_positions - pred_start_pos, j] = shift_losses_i[cur_positions_indexes, j] * weights[j]
+            weights_dict[i, cur_positions - pred_start_pos, j] = weights[j]
+    losses = (losses_dict.sum(-1) / weights_dict.sum(-1)).mean(-1)
+    # print('[P2-2]', time.time() - stime)
+
+    return losses, candidates
+
+

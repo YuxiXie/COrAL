@@ -434,7 +434,13 @@ def main() -> None:
     seed_everything(args.seed)
     set_logger_level()
 
-    dist.barrier()
+    flag = True
+    while flag:
+        try:
+            dist.barrier()
+            flag = False
+        except:
+            flag = True
 
     ds_config = get_deepspeed_train_config(
         micro_batch_size_per_gpu=args.per_device_train_batch_size,
@@ -454,7 +460,13 @@ def main() -> None:
     else:
         ds_eval_config = None
 
-    trainer = OASupervisedFinetuneTrainer(args, ds_config, ds_eval_config)
+    flag = True
+    while flag:
+        try:
+            trainer = OASupervisedFinetuneTrainer(args, ds_config, ds_eval_config)
+            flag = False
+        except:
+            flag = True
     trainer.train()
     # trainer.save()
 
