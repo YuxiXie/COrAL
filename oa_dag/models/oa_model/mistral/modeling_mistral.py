@@ -769,11 +769,12 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
         forward_size: int = 4,
         backward_size: int = 8,
         eval_forward_size: int = 1,
-        eval_backward_size: int = -1,
+        eval_backward_size: int = 2,
         occurance_threshold: int = 8,
         topk: int = 16,
         topp: float = .95,
         max_iter_times: int = 512,
+        last_iter_times: int = 4,
         verbal: bool = False,
     ):
         # import time
@@ -788,6 +789,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
         keep_generate, tracks = True, []
         pred_start_pos = fixed_seq_length = seq_length
         occurance_counts = torch.ones_like(input_ids)  # record the occurance times of predicted tokens
+        iter_cnt_last, iter_cnt_mid, prev_max_start_idx = 0, 0, -1
         while keep_generate:
             # stime = time.time()
             outputs: OAModelOutput = self(
@@ -851,6 +853,8 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
             
             # EOS
             eos_idx = new_input_ids[0].eq(tokenizer.eos_token_id).nonzero().squeeze(-1)
+            if eos_idx.size(-1) > 0:
+                iter_cnt_last += 1
             eos_idx = eos_idx[0] + 1 if eos_idx.size(-1) > 0 else max_length
             new_input_ids = new_input_ids[:, :eos_idx]
             tracks.append([
@@ -873,21 +877,27 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
             few_times_idx = few_times_indexes[0] + fixed_seq_length if few_times_indexes.size(-1) > 0 else occurance_counts.size(-1)
             few_times_idx = (pred_start_pos + few_times_indexes.min()).item() if few_times_indexes.size(-1) > 0 else occurance_counts.size(-1)
             
-            occurance_gaps = occurance_counts[0][:-1] - occurance_counts[0][1:]
-            large_gap_idx = occurance_gaps[fixed_seq_length:].ge(occurance_threshold).nonzero().squeeze(-1)
-            if large_gap_idx.size(-1) > 0:
-                large_gap_idx = large_gap_idx[0] + fixed_seq_length + 1
-                # fixed_seq_length = max(large_gap_idx, fixed_seq_length)
-            fixed_seq_length = max(fixed_seq_length, new_input_ids.size(-1) - block_size + forward_size)
-            start_idx = fixed_seq_length
+            # occurance_gaps = occurance_counts[0][:-1] - occurance_counts[0][1:]
+            # large_gap_idx = occurance_gaps[fixed_seq_length:].ge(occurance_threshold).nonzero().squeeze(-1)
+            # if large_gap_idx.size(-1) > 0:
+            #     large_gap_idx = large_gap_idx[0] + fixed_seq_length + 1
+            #     # fixed_seq_length = max(large_gap_idx, fixed_seq_length)
+            fixed_seq_length = min(few_times_idx, max(fixed_seq_length, new_input_ids.size(-1) - block_size + forward_size))
+            start_idx, end_idx = fixed_seq_length, fixed_seq_length + block_size
             
-            if (new_input_ids[0].eq(tokenizer.eos_token_id).any() and few_times_idx >= eos_idx) or len(tracks) > max_iter_times:
+            if start_idx <= prev_max_start_idx:
+                iter_cnt_mid += 1
+            else:
+                iter_cnt_mid = 0
+            if iter_cnt_mid > last_iter_times:
+                fixed_seq_length = start_idx = min(prev_max_start_idx + 1, new_input_ids.size(-1))
+                end_idx = prev_max_start_idx + 1 + block_size
+                iter_cnt_mid = 0
+            prev_max_start_idx = max(prev_max_start_idx, start_idx)
+            print(input_ids.size(-1), new_input_ids.size(-1), start_idx, end_idx, prev_max_start_idx)
+            if (new_input_ids[0].eq(tokenizer.eos_token_id).any() and few_times_idx >= eos_idx) or iter_cnt_last > last_iter_times or len(tracks) > max_iter_times:
                 keep_generate = False
                 input_ids = new_input_ids
-                break
-            
-            if new_input_ids[0].eq(tokenizer.eos_token_id).any():
-                # import ipdb; ipdb.set_trace()
                 break
             
             # update position_ids, position_ids_to_predict
@@ -897,9 +907,10 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
             _position_ids_to_predict = torch.arange(forward_size + backward_size + 1, dtype=torch.long, device=input_ids.device)
             tmp_position_ids_to_predict = (_position_ids_to_predict - backward_size) + torch.arange(input_ids.size(-1), dtype=torch.long, device=input_ids.device).view(-1, 1)
             tmp_position_ids_to_predict = tmp_position_ids_to_predict.unsqueeze(0).expand(batch_size, input_ids.size(-1), forward_size + backward_size + 1).contiguous()
-            new_position_ids_to_predict = (tmp_position_ids_to_predict * tmp_position_ids_to_predict.ge(start_idx) * tmp_position_ids_to_predict.le(end_idx)).long()
+            tmp_position_ids_to_predict = tmp_position_ids_to_predict.masked_fill(tmp_position_ids_to_predict.lt(start_idx), 0)
+            tmp_position_ids_to_predict = tmp_position_ids_to_predict.masked_fill(tmp_position_ids_to_predict.gt(end_idx), 0)
             
-            position_ids_to_predict = new_position_ids_to_predict            
+            position_ids_to_predict = tmp_position_ids_to_predict            
         
         return tracks, input_ids
     

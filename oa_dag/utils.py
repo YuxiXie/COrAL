@@ -326,8 +326,8 @@ def pad_tensors(tensors, max_len=-1, pad_value=IGNORE_INDEX):
         max_len = max([len(x) for x in tensors])
     for i in range(len(tensors)):
         pad_len = max_len - len(tensors[i])
-        tmp = torch.ones((pad_len,), dtype=torch.long, device=tensors[i].device)
-        tensors[i] = torch.cat((tensors[i], tmp * pad_value), dim=-1).long()
+        tmp = torch.ones((pad_len,) + tensors[i].shape[1:], dtype=torch.long, device=tensors[i].device)
+        tensors[i] = torch.cat((tensors[i], tmp * pad_value), dim=0).long()
     return torch.stack(tensors, dim=0)
 
 
@@ -486,7 +486,7 @@ def get_exp_dist(forward_size=4, backward_size=8, forward_scale=8, backward_scal
     
     x_backward = -torch.arange(0, backward_size - 1) + backward_size - 2
     x_backward = torch.cat((x_backward, torch.arange(1, 3)), dim=-1)
-    x_backward = (-backward_scale * x_backward).exp()
+    x_backward = (-backward_scale * x_backward).exp()[-backward_size - 1:]
     
     return torch.cat((x_backward, x_forward), dim=-1)
 
@@ -787,7 +787,7 @@ def prepare_candidates(
         create_tree_attention_mask(
             logprobs, 
             topk=topk, 
-            forward_size=forward_size,
+            forward_size=min(forward_size, max(0, pred_end_pos + 1 - input_ids.size(-1))),
             maximum_seq_len=max_new_tokens,
         )
     retrieve_indices = retrieve_indices + input_ids[0, :pred_start_pos].size(-1) - 1

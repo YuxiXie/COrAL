@@ -127,7 +127,8 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             return tracks
         else:
             batch = self.corruption(input_ids=input_ids, labels=labels, attention_mask=attention_mask,
-                                    fixed_replace_threshold=self.args.eval_replace_ratio, force_replace=True)
+                                    fixed_replace_threshold=self.args.eval_replace_ratio, force_replace=self.args.eval_replace_ratio > 0,
+                                    is_training=False)
             outputs = self.loss(
                 input_ids=batch['input_ids'],
                 attention_mask=batch['attention_mask'],
@@ -340,6 +341,76 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         results = torch.topk(F.softmax(logits, dim=-1), k=topk, dim=-1)
         return results.values, results.indices
     
+    def context_corruption(
+        self,
+        input_ids: torch.LongTensor,
+        labels: torch.LongTensor,
+    ):
+        batch_size = input_ids.size(0)
+        
+        new_input_ids, new_labels = [], []
+        position_ids_to_predict, labels_to_predict = [], []
+        inject_ratio = 0
+        ##=== corrupt context order ===##
+        for i in range(batch_size):
+            ##=== extract label positions ===##
+            is_label = labels[i].ne(IGNORE_INDEX)
+            label_position_ids = is_label.nonzero().squeeze(-1)
+            # patition into contexts
+            label_start_idx = label_position_ids[0].item()
+            context_size = max(2, label_position_ids.size(-1) // self.args.corrupt_context_num)
+            num_contexts = (label_position_ids.size(-1) + context_size - 1) // context_size
+            ##=== initialize input ids with position info ===##
+            cur_input_ids = input_ids[i].clone()[:label_start_idx]
+            cur_labels = labels[i].clone()[:label_start_idx]
+            ##=== construct shuffled contexts ===##
+            keep_inject = True
+            while keep_inject:
+                cur_inject_cnt = 0
+                for j in range(num_contexts):
+                    gt_context = input_ids[i].clone()[label_position_ids[j * context_size: (j + 1) * context_size]]
+                    if 0 < j < num_contexts - 1 and random.random() < self.args.context_inject_ratio:
+                        fake_context_idx = random.randint(j + 1, num_contexts - 1)
+                        fake_context = input_ids[i].clone()[label_position_ids[fake_context_idx * context_size: (fake_context_idx + 1) * context_size]]
+                        cur_input_ids = torch.cat((cur_input_ids, fake_context), dim=-1)
+                        cur_labels = torch.cat((cur_labels, gt_context[:fake_context.size(-1)]), dim=-1)
+                        cur_inject_cnt += 1
+                    cur_input_ids = torch.cat((cur_input_ids, gt_context), dim=-1)
+                    cur_labels = torch.cat((cur_labels, gt_context), dim=-1)
+                if cur_inject_cnt > 0 or num_contexts < 3:
+                    keep_inject = False
+                else:
+                    cur_input_ids = input_ids[i].clone()[:label_start_idx]
+                    cur_labels = labels[i].clone()[:label_start_idx]
+            inject_ratio += cur_inject_cnt / max(1, num_contexts - 1)
+            new_input_ids.append(cur_input_ids)
+            new_labels.append(cur_labels)
+            ##=== craft input-output target ===##
+            cur_position_ids_to_predict = torch.arange(self.backward_context_window + 1, dtype=torch.long, device=self.args.device)
+            cur_position_ids_to_predict = (cur_position_ids_to_predict - self.backward_context_window) + torch.arange(cur_input_ids.size(-1), dtype=torch.long, device=self.args.device).view(-1, 1)
+            cur_position_ids_to_predict = cur_position_ids_to_predict.masked_fill(cur_position_ids_to_predict.lt(label_start_idx), 0)
+            cur_position_ids_to_predict = cur_position_ids_to_predict.masked_fill(cur_position_ids_to_predict.ge(cur_labels.size(-1)), 0)
+            cur_labels_to_predict = cur_labels[cur_position_ids_to_predict]
+            position_ids_to_predict.append(cur_position_ids_to_predict)
+            labels_to_predict.append(cur_labels_to_predict)
+        new_input_ids = pad_tensors(new_input_ids, pad_value=self.tokenizer.pad_token_id)[:, :self.args.max_length]
+        new_labels = pad_tensors(new_labels)[:, :self.args.max_length]
+        position_ids_to_predict = pad_tensors(position_ids_to_predict, pad_value=0)[:, :self.args.max_length, ...]
+        labels_to_predict = pad_tensors(labels_to_predict)[:, :self.args.max_length, ...]
+        
+        return {
+            'input_ids': new_input_ids,     # (B, L)
+            'labels': labels_to_predict,        # (B, L, Wf + Wb + 1)
+            'attention_mask': new_input_ids.ne(self.tokenizer.pad_token_id),      # (B, L)
+            'position_ids': torch.arange(0, new_input_ids.size(-1), dtype=torch.long, device=self.args.device).unsqueeze(0).repeat(batch_size, 1),     # (B, L)
+            'position_ids_to_predict': position_ids_to_predict,        # (B, L, Wf + Wb + 1)
+            'topk_probs': None,
+            'topk_ids': None,
+            'replace_indexes': None,
+            'replace_threshold': self.args.context_inject_ratio,
+            'replace_ratio': inject_ratio / batch_size,
+        }
+    
     @torch.no_grad()
     def corruption(
         self,
@@ -350,14 +421,26 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         fixed_replace_threshold: float = -1,
         is_training: bool = True,
     ) -> dict[str, Any]:
+        
+        if force_replace and self.args.context_corrupt:
+            return self.context_corruption(
+                input_ids=input_ids,
+                labels=labels,
+            )
+        
         batch_size, seq_length = input_ids.size(0), input_ids.size(-1)
         raw_position_ids = torch.arange(0, seq_length, dtype=torch.long, device=self.args.device)
         
         replace_threshold_list, replace_ratio_list, replace_position_ids, replace_indexes = [], [], [], []
-        force_replace = force_replace and fixed_replace_threshold < 0
+        # force_replace = force_replace and fixed_replace_threshold < 0
         
         new_input_ids = input_ids.clone()
-        if force_replace:
+        if not is_training:
+            position_ids_to_predict = torch.arange(self.forward_context_window + self.backward_context_window + 1, dtype=torch.long, device=self.args.device)
+            position_ids_to_predict = (position_ids_to_predict - self.backward_context_window) + torch.arange(seq_length, dtype=torch.long, device=self.args.device).view(-1, 1)
+            position_ids_to_predict = position_ids_to_predict.unsqueeze(0).expand(batch_size, seq_length, self.forward_context_window + self.backward_context_window + 1).contiguous()
+            padded_labels = torch.zeros(batch_size, seq_length, self.forward_context_window + self.backward_context_window + 1, dtype=torch.long, device=self.args.device)
+        elif force_replace:
             position_ids_to_predict = torch.arange(self.backward_context_window + 1, dtype=torch.long, device=self.args.device)
             position_ids_to_predict = (position_ids_to_predict - self.backward_context_window) + torch.arange(seq_length, dtype=torch.long, device=self.args.device).view(-1, 1)
             position_ids_to_predict = position_ids_to_predict.unsqueeze(0).expand(batch_size, seq_length, self.backward_context_window + 1).contiguous()
@@ -439,7 +522,8 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 #         idx = topk_probs[bid][j].max(dim=-1).indices
                 #         orig_input_ids[replace_indexes[bid][j]] = topk_ids[bid][j][idx]
                 #     padded_labels[bid] = orig_input_ids[position_ids_to_predict[bid]]
-                #     import ipdb; ipdb.set_trace()
+        
+        # import ipdb; ipdb.set_trace()
         return {
             'input_ids': new_input_ids,     # (B, L)
             'labels': padded_labels,        # (B, L, Wf + Wb + 1)

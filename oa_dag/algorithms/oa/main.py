@@ -83,6 +83,21 @@ def parse_arguments() -> argparse.Namespace:
     # Training
     training_parser = parser.add_argument_group('training')
     training_parser.add_argument(
+        '--corrupt_context_num',
+        default=8,
+        type=int,
+    )
+    training_parser.add_argument(
+        '--context_inject_ratio',
+        default=0.0,
+        type=float,
+    )
+    training_parser.add_argument(
+        '--context_corrupt',
+        default=False,
+        action='store_true',
+    )
+    training_parser.add_argument(
         '--sample_to_replace',
         default=False,
         action='store_true',

@@ -36,8 +36,13 @@ from oa_dag.datasets.raw.math import MetaMathTrainDataset, MetaMathValidDataset,
 from oa_dag.datasets.raw.reasoning import MagpieTrainDataset
 from oa_dag.datasets.raw.tulu import TuluTrainDataset
 from oa_dag.datasets.raw.cot import CoTTrainDataset
-from oa_dag.datasets.raw.logicot import LogiCoTTrainDataset
+from oa_dag.datasets.raw.logicot import LogiCoTTrainDataset, LogiCoTFilterTrainDataset
 from oa_dag.datasets.raw.strategyqa import SQADataset
+from oa_dag.datasets.raw.logieval import (
+    LogiQADataset, LogiQAZhDataset, LogiQAOodDataset,
+    ReclorDataset, ALDataset,
+    ControlDataset, ConjNLIDataset,
+)
 
 
 __all__ = [
@@ -70,6 +75,15 @@ __all__ = [
     'TuluTrainDataset',
     
     'LogiCoTTrainDataset',
+    'LogiCoTFilterTrainDataset',
     
     'SQADataset',
+    
+    'LogiQADataset', 
+    'LogiQAZhDataset', 
+    'LogiQAOodDataset',
+    'ReclorDataset', 
+    'ALDataset',
+    'ControlDataset', 
+    'ConjNLIDataset',
 ]
