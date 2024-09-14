@@ -680,7 +680,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
             assert position_ids_to_predict is not None and position_ids_to_predict.size() == labels.size()
             # Flatten the tokens
             shift_logits = logits.contiguous().view(-1, self.config.vocab_size)
-            shift_labels = labels.view(-1)
+            shift_labels = labels.contiguous().view(-1)
             # Ensure tensors are on the same device
             shift_labels = shift_labels.to(shift_logits.device)
             loss_fct = nn.CrossEntropyLoss()

@@ -67,7 +67,15 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             if not self.model.additional_layer:
                 self.model.base_model.layers[-1].requires_grad_(True)
                 self.model.base_model.oa_layer.requires_grad_(True)
-        self.model.lm_head.requires_grad_(self.args.tune_lm_head)        
+        if self.args.tune_backbone_only:
+            for name, param in self.model.base_model.named_parameters():
+                if self.model.additional_layer or f'layers.{self.model.config.num_hidden_layers - 1}' not in name:
+                    param.requires_grad = True
+            self.model.oa_layer.requires_grad_(False)
+            if not self.model.additional_layer:
+                self.model.base_model.layers[-1].requires_grad_(False)
+                self.model.base_model.oa_layer.requires_grad_(False)
+        self.model.lm_head.requires_grad_(self.args.tune_lm_head)
     
     @property
     def extra_model_kwargs(self) -> dict[str, Any]:
@@ -358,7 +366,8 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             label_position_ids = is_label.nonzero().squeeze(-1)
             # patition into contexts
             label_start_idx = label_position_ids[0].item()
-            context_size = max(2, label_position_ids.size(-1) // self.args.corrupt_context_num)
+            # context_size = max(2, label_position_ids.size(-1) // self.args.corrupt_context_num)
+            context_size = min(self.backward_context_window, max(2, label_position_ids.size(-1) // self.args.corrupt_context_num))
             num_contexts = (label_position_ids.size(-1) + context_size - 1) // context_size
             ##=== initialize input ids with position info ===##
             cur_input_ids = input_ids[i].clone()[:label_start_idx]
@@ -393,10 +402,13 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             cur_labels_to_predict = cur_labels[cur_position_ids_to_predict]
             position_ids_to_predict.append(cur_position_ids_to_predict)
             labels_to_predict.append(cur_labels_to_predict)
-        new_input_ids = pad_tensors(new_input_ids, pad_value=self.tokenizer.pad_token_id)[:, :self.args.max_length]
-        new_labels = pad_tensors(new_labels)[:, :self.args.max_length]
-        position_ids_to_predict = pad_tensors(position_ids_to_predict, pad_value=0)[:, :self.args.max_length, ...]
-        labels_to_predict = pad_tensors(labels_to_predict)[:, :self.args.max_length, ...]
+        new_input_ids = pad_tensors(new_input_ids, pad_value=self.tokenizer.pad_token_id)[:, :self.args.max_length].contiguous()
+        new_labels = pad_tensors(new_labels)[:, :self.args.max_length].contiguous()
+        position_ids_to_predict = pad_tensors(position_ids_to_predict, pad_value=0)[:, :self.args.max_length, ...].contiguous()
+        labels_to_predict = pad_tensors(labels_to_predict)[:, :self.args.max_length, ...].contiguous()
+        
+        print(self.tokenizer.decode(new_input_ids[0], skip_special_tokens=True))
+        print(self.tokenizer.decode(input_ids[0], skip_special_tokens=True))
         
         return {
             'input_ids': new_input_ids,     # (B, L)
@@ -407,8 +419,8 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             'topk_probs': None,
             'topk_ids': None,
             'replace_indexes': None,
-            'replace_threshold': self.args.context_inject_ratio,
-            'replace_ratio': inject_ratio / batch_size,
+            'replace_threshold': torch.tensor(self.args.context_inject_ratio, device=self.args.device).float(),
+            'replace_ratio': torch.tensor(inject_ratio / batch_size, device=self.args.device).float(),
         }
     
     @torch.no_grad()
@@ -606,6 +618,13 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         loss_dn = get_all_reduce_mean(loss_dn)
         loss_ar = get_all_reduce_mean(loss_ar)
         loss_close = get_all_reduce_mean(loss_close)
+        
+        if self.args.tune_backbone_only:
+            if self.global_step / len(self.train_dataloader) >= 1:
+                self.model.oa_layer.requires_grad_(True)
+                if not self.model.additional_layer:
+                    self.model.base_model.layers[-1].requires_grad_(True)
+                    self.model.base_model.oa_layer.requires_grad_(True)
         
         dist.barrier()
         
