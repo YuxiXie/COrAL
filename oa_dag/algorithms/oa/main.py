@@ -160,6 +160,11 @@ def parse_arguments() -> argparse.Namespace:
         action='store_true',
     )
     training_parser.add_argument(
+        '--tune_backbone_only',
+        default=False,
+        action='store_true',
+    )
+    training_parser.add_argument(
         '--tune_lm_head',
         default=False,
         action='store_true',
@@ -426,7 +431,7 @@ def parse_arguments() -> argparse.Namespace:
     if args.tf32 is not None and is_torch_tf32_available():
         torch.backends.cuda.matmul.allow_tf32 = args.tf32
     
-    if not args.tune_final_layer_only:
+    if not args.tune_final_layer_only and not args.tune_backbone_only:
         args.tune_lm_head = True
     args.lazy_tokenization = not args.not_lazy_tokenization
 
