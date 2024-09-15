@@ -88,11 +88,6 @@ def parse_arguments() -> argparse.Namespace:
         type=int,
     )
     training_parser.add_argument(
-        '--context_inject_ratio',
-        default=0.0,
-        type=float,
-    )
-    training_parser.add_argument(
         '--context_corrupt',
         default=False,
         action='store_true',

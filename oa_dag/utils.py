@@ -365,6 +365,41 @@ def add_noise(cur_input_ids: torch.LongTensor, cur_labels: torch.LongTensor, rat
     return replace_ids, replace_threshold
 
 
+def corrupt_context(cur_input_ids: torch.LongTensor, cur_labels: torch.LongTensor, 
+                    raw_input_ids: torch.LongTensor, raw_labels: torch.LongTensor, raw_label_positions: torch.LongTensor,
+                    context_size: int, num_contexts: int, context_inject_ratio_generator):
+    label_start_idx = raw_label_positions[0].item()
+    keep_inject = True
+    while keep_inject:
+        cur_inject_cnt = 0
+        context_inject_ratio = context_inject_ratio_generator.rvs(1)[0]
+        for j in range(num_contexts):
+            gt_context = raw_input_ids.clone()[raw_label_positions[j * context_size: (j + 1) * context_size]]
+            if random.random() < context_inject_ratio:
+                fake_context_idx = random.randint(0, num_contexts - 1)
+                fake_context = raw_input_ids.clone()[raw_label_positions[fake_context_idx * context_size: (fake_context_idx + 1) * context_size]]
+                min_len = min(gt_context.size(-1), fake_context.size(-1))
+                tmp_context = gt_context.clone()
+                tmp_context[:min_len] = fake_context[:min_len]
+                fake_context = tmp_context
+                cur_input_ids = torch.cat((cur_input_ids, fake_context), dim=-1)
+                cur_labels = torch.cat((cur_labels, gt_context), dim=-1)
+                cur_inject_cnt += 1
+            elif random.random() < context_inject_ratio:
+                cur_input_ids = torch.cat((cur_input_ids, gt_context), dim=-1)
+                cur_labels = torch.cat((cur_labels, gt_context), dim=-1)
+                cur_inject_cnt += 1
+            else:
+                cur_input_ids = torch.cat((cur_input_ids, gt_context), dim=-1)
+                cur_labels = torch.cat((cur_labels, torch.ones_like(gt_context, dtype=torch.long) * IGNORE_INDEX), dim=-1)
+        if cur_inject_cnt > 0:
+            keep_inject = False
+        else:
+            cur_input_ids = raw_input_ids.clone()[:label_start_idx]
+            cur_labels = raw_labels.clone()[:label_start_idx]
+    return cur_input_ids, cur_labels, cur_inject_cnt, context_inject_ratio
+
+
 def decode_masked_text(input_ids: torch.LongTensor, position_ids: torch.LongTensor, replace_indexes: torch.LongTensor, tokenizer, topk_ids: torch.LongTensor = None):
     if topk_ids is not None:
         _replace_indexes = replace_indexes[replace_indexes.ge(0).nonzero().squeeze(-1)]
