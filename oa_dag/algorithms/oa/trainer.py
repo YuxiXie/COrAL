@@ -156,7 +156,8 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             shift_logits = logits.contiguous().view(-1, logits.size(-1))
             shift_labels = batch['labels'].view(-1)
             loss_fct = CrossEntropyLoss(reduction='none')
-            losses = loss_fct(shift_logits, shift_labels).view(logits.size(0), -1, batch['labels'].size(-1))    # (B, L, Wf + Wb + 1)
+            # losses = loss_fct(shift_logits, shift_labels).view(logits.size(0), -1, batch['labels'].size(-1))    # (B, L, Wf + Wb + 1)
+            losses = shift_logits.topk(k=16, dim=-1).indices[..., int(self.args.result_fname[-1]) - 1].eq(shift_labels).to(logits.dtype).view(logits.size(0), -1, batch['labels'].size(-1))
             
             relative_positions = batch['position_ids_to_predict'] - batch['position_ids'].unsqueeze(-1)    # (B, L, Wf + Wb + 1)
             small_pos, large_pos = relative_positions.min().item(), relative_positions.max().item()
@@ -350,80 +351,6 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         results = torch.topk(F.softmax(logits, dim=-1), k=topk, dim=-1)
         return results.values, results.indices
     
-    # def context_corruption(
-    #     self,
-    #     input_ids: torch.LongTensor,
-    #     labels: torch.LongTensor,
-    # ):
-    #     batch_size = input_ids.size(0)
-        
-    #     new_input_ids, new_labels = [], []
-    #     position_ids_to_predict, labels_to_predict = [], []
-    #     inject_ratio = 0
-    #     ##=== corrupt context order ===##
-    #     for i in range(batch_size):
-    #         ##=== extract label positions ===##
-    #         is_label = labels[i].ne(IGNORE_INDEX)
-    #         label_position_ids = is_label.nonzero().squeeze(-1)
-    #         # patition into contexts
-    #         label_start_idx = label_position_ids[0].item()
-    #         # context_size = max(2, label_position_ids.size(-1) // self.args.corrupt_context_num)
-    #         context_size = min(self.backward_context_window, max(2, label_position_ids.size(-1) // self.args.corrupt_context_num))
-    #         num_contexts = (label_position_ids.size(-1) + context_size - 1) // context_size
-    #         ##=== initialize input ids with position info ===##
-    #         cur_input_ids = input_ids[i].clone()[:label_start_idx]
-    #         cur_labels = labels[i].clone()[:label_start_idx]
-    #         ##=== construct shuffled contexts ===##
-    #         keep_inject = True
-    #         while keep_inject:
-    #             cur_inject_cnt = 0
-    #             for j in range(num_contexts):
-    #                 gt_context = input_ids[i].clone()[label_position_ids[j * context_size: (j + 1) * context_size]]
-    #                 if 0 < j < num_contexts - 1 and random.random() < self.args.context_inject_ratio:
-    #                     fake_context_idx = random.randint(j + 1, num_contexts - 1)
-    #                     fake_context = input_ids[i].clone()[label_position_ids[fake_context_idx * context_size: (fake_context_idx + 1) * context_size]]
-    #                     cur_input_ids = torch.cat((cur_input_ids, fake_context), dim=-1)
-    #                     cur_labels = torch.cat((cur_labels, gt_context[:fake_context.size(-1)]), dim=-1)
-    #                     cur_inject_cnt += 1
-    #                 cur_input_ids = torch.cat((cur_input_ids, gt_context), dim=-1)
-    #                 cur_labels = torch.cat((cur_labels, gt_context), dim=-1)
-    #             if cur_inject_cnt > 0 or num_contexts < 3:
-    #                 keep_inject = False
-    #             else:
-    #                 cur_input_ids = input_ids[i].clone()[:label_start_idx]
-    #                 cur_labels = labels[i].clone()[:label_start_idx]
-    #         inject_ratio += cur_inject_cnt / max(1, num_contexts - 1)
-    #         new_input_ids.append(cur_input_ids)
-    #         new_labels.append(cur_labels)
-    #         ##=== craft input-output target ===##
-    #         cur_position_ids_to_predict = torch.arange(self.backward_context_window + 1, dtype=torch.long, device=self.args.device)
-    #         cur_position_ids_to_predict = (cur_position_ids_to_predict - self.backward_context_window) + torch.arange(cur_input_ids.size(-1), dtype=torch.long, device=self.args.device).view(-1, 1)
-    #         cur_position_ids_to_predict = cur_position_ids_to_predict.masked_fill(cur_position_ids_to_predict.lt(label_start_idx), 0)
-    #         cur_position_ids_to_predict = cur_position_ids_to_predict.masked_fill(cur_position_ids_to_predict.ge(cur_labels.size(-1)), 0)
-    #         cur_labels_to_predict = cur_labels[cur_position_ids_to_predict]
-    #         position_ids_to_predict.append(cur_position_ids_to_predict)
-    #         labels_to_predict.append(cur_labels_to_predict)
-    #     new_input_ids = pad_tensors(new_input_ids, pad_value=self.tokenizer.pad_token_id)[:, :self.args.max_length].contiguous()
-    #     new_labels = pad_tensors(new_labels)[:, :self.args.max_length].contiguous()
-    #     position_ids_to_predict = pad_tensors(position_ids_to_predict, pad_value=0)[:, :self.args.max_length, ...].contiguous()
-    #     labels_to_predict = pad_tensors(labels_to_predict)[:, :self.args.max_length, ...].contiguous()
-        
-    #     print(self.tokenizer.decode(new_input_ids[0], skip_special_tokens=True))
-    #     print(self.tokenizer.decode(input_ids[0], skip_special_tokens=True))
-        
-    #     return {
-    #         'input_ids': new_input_ids,     # (B, L)
-    #         'labels': labels_to_predict,        # (B, L, Wf + Wb + 1)
-    #         'attention_mask': new_input_ids.ne(self.tokenizer.pad_token_id),      # (B, L)
-    #         'position_ids': torch.arange(0, new_input_ids.size(-1), dtype=torch.long, device=self.args.device).unsqueeze(0).repeat(batch_size, 1),     # (B, L)
-    #         'position_ids_to_predict': position_ids_to_predict,        # (B, L, Wf + Wb + 1)
-    #         'topk_probs': None,
-    #         'topk_ids': None,
-    #         'replace_indexes': None,
-    #         'replace_threshold': torch.tensor(self.args.context_inject_ratio, device=self.args.device).float(),
-    #         'replace_ratio': torch.tensor(inject_ratio / batch_size, device=self.args.device).float(),
-    #     }
-    
     def context_corruption(
         self,
         input_ids: torch.LongTensor,
@@ -442,7 +369,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             # patition into contexts
             label_start_idx = label_position_ids[0].item()
             # context_size = max(2, label_position_ids.size(-1) // self.args.corrupt_context_num)
-            context_size = min(self.backward_context_window // 2, max(2, label_position_ids.size(-1) // self.args.corrupt_context_num))
+            context_size = min(self.backward_context_window // 1, max(2, label_position_ids.size(-1) // self.args.corrupt_context_num))
             num_contexts = (label_position_ids.size(-1) + context_size - 1) // context_size
             ##=== initialize input ids with position info ===##
             cur_input_ids = input_ids[i].clone()[:label_start_idx]

@@ -16,16 +16,16 @@ from transformers.modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask_for_sdpa, 
     _prepare_4d_causal_attention_mask,
 )
-from transformers.generation.utils import LogitsProcessorList, TemperatureLogitsWarper, TopKLogitsWarper, TopPLogitsWarper
+from transformers.generation.utils import (
+    LogitsProcessorList, TemperatureLogitsWarper, 
+    TopKLogitsWarper, TopPLogitsWarper, EtaLogitsWarper,
+)
 from transformers.utils import logging
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.utils.doc import add_start_docstrings_to_model_forward, replace_return_docstrings
 
 from oa_dag.models.oa_model import OAModelMixin, OAModelOutput, BaseModelOutputWithPastOA
 from oa_dag.utils import (
-    pad_tensors, locate_quantity, get_normal_dist, get_hyperbolic_dist, 
-    calculate_jsd_variance_log, extract_logprobs_into_dict,
-    gather_kl_variance_dict, create_tree_attention_mask, prepare_candidate_input_output, get_exp_dist,
     prepare_candidates, calculate_candidate_losses,
 )
 from oa_dag.configs.constants import IGNORE_INDEX
@@ -772,7 +772,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
         eval_backward_size: int = 2,
         occurance_threshold: int = 8,
         topk: int = 16,
-        topp: float = .95,
+        topp: float = .99,
         max_iter_times: int = 512,
         last_iter_times: int = 4,
         verbal: bool = False,
@@ -781,6 +781,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
         
         processors = LogitsProcessorList()
         # processors.append(TopPLogitsWarper(top_p=topp, min_tokens_to_keep=1))
+        processors.append(EtaLogitsWarper(epsilon=1-topp))
         # greedy_processors = LogitsProcessorList()
         # greedy_processors.append(TopKLogitsWarper(top_k=1, min_tokens_to_keep=1))
         
@@ -835,7 +836,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
             # print('[F2]', time.time() - stime)
             
             # stime = time.time()
-            losses, candidates = calculate_candidate_losses(
+            losses, losses_gap, nt_losses, candidates = calculate_candidate_losses(
                 cur_input_ids=cur_input_ids,
                 cur_position_ids_to_predict=cur_position_ids_to_predict,
                 candidate_logits=candidate_logits,
@@ -845,11 +846,14 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
                 forward_size=eval_forward_size,
                 backward_size=eval_backward_size,
             )
+            # losses, all_losses = nt_losses, losses
             # print('[P2]', time.time() - stime)
             
             tokens = candidates[losses.min(dim=-1).indices].contiguous().view(batch_size, -1)   # (1, T)
             new_input_ids = torch.cat((input_ids[:, :pred_start_pos], tokens), dim=-1)
-            candidates = candidates[losses.sort(dim=-1).indices]
+            # candidates = candidates[all_losses.sort(dim=-1).indices]
+            # candidates = candidates[losses_gap.sort(dim=-1).indices]
+            # candidates = candidates[losses.sort(dim=-1).indices]
             
             # EOS
             eos_idx = new_input_ids[0].eq(tokenizer.eos_token_id).nonzero().squeeze(-1)

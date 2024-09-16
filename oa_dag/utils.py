@@ -29,7 +29,7 @@ from transformers.modeling_outputs import ModelOutput
 from transformers.generation.utils import LogitsProcessorList
 from transformers.tokenization_utils import BatchEncoding, PaddingStrategy, TruncationStrategy
 
-from oa_dag.configs.constants import PROMPT_ASSISTANT, IGNORE_INDEX
+from oa_dag.configs.constants import PROMPT_ASSISTANT, IGNORE_INDEX, metamath_accu
 
 
 __all__ = [
@@ -632,17 +632,26 @@ def create_tree_attention_mask(logprobs: torch.FloatTensor, forward_size: int = 
     results = torch.topk(logprobs.view(-1, logprobs.size(-1)), k=topk, dim=-1)
     topk = results.values.size(-1)
     
+    # # sort tokens by accuracies
+    # accuracies = results.values.clone().exp()
+    # accu_matrix = torch.tensor(metamath_accu).to(accuracies.dtype).to(accuracies.device) / 100
+    # accu_idx = 8 if forward_size < 1 else (8 + forward_size)
+    # cnt = min(accu_idx + 1, accuracies.size(0))
+    # _k = min(accu_matrix.size(-1), accuracies.size(-1))
+    # accuracies[-cnt:, :_k] = accu_matrix[accu_idx - cnt + 1: accu_idx + 1, :_k]
+    # sorted_conf = accuracies.view(-1).sort(descending=True)
+    
     # sort tokens by confidence scores
-    confidence = results.values
+    confidence = results.values.clone()
     for i in range(forward_size):
         # scale last few tokens
-        confidence[-i - 1] = confidence[-i - 1] / (forward_size - i)
+        confidence[-i - 1] = confidence[-i - 1] / (forward_size - i + topk - 1) * topk
     # if n_depth > forward_size:
         # scale_len = min(n_depth - forward_size, 3)
         # confidence[:scale_len] = confidence[:scale_len] / max(forward_size - 1, 2)
         # confidence[0] = confidence[0] / max(forward_size - 1, 2)
-    confidence = confidence.exp().view(-1)
-    sorted_conf = confidence.sort(descending=True)
+    confidence = confidence.exp()
+    sorted_conf = confidence.view(-1).sort(descending=True)
     
     positions = torch.arange(0, n_depth, dtype=torch.long, device=logprobs.device).unsqueeze(-1).expand(n_depth, topk)
     topk_indexes = torch.arange(0, topk, dtype=torch.long, device=logprobs.device).unsqueeze(0).expand(n_depth, topk)
@@ -655,6 +664,7 @@ def create_tree_attention_mask(logprobs: torch.FloatTensor, forward_size: int = 
     for idx in sorted_conf.indices:
         if idx % topk == 0: continue
         pos, k = positions[idx].item(), topk_indexes[idx].item()
+        if torch.isinf(results.values[pos, k]): continue
         tmp_combinations = []
         for comb in combinations:
             comb = comb[:]
@@ -890,7 +900,10 @@ def calculate_candidate_losses(
             weights_dict[i, cur_positions - pred_start_pos, j] = weights[j]
     losses = (losses_dict.sum(-1) / weights_dict.sum(-1)).mean(-1)
     # print('[P2-2]', time.time() - stime)
-
-    return losses, candidates
-
-
+    
+    losses_1 = (losses_dict[..., :backward_size + 2].sum(-1) / weights_dict[..., :backward_size + 2].sum(-1)).mean(-1)
+    weights_2 = weights_dict[..., backward_size + 2:].sum(-1)
+    weights_2 = weights_2.masked_fill(weights_2.eq(0), 1)
+    losses_2 = (losses_dict[..., backward_size + 2:].sum(-1) / weights_2).mean(-1)
+    
+    return losses, losses_1 - losses_2, losses_dict[..., backward_size + 1].mean(-1) / weights_dict[..., backward_size + 1].mean(-1), candidates
