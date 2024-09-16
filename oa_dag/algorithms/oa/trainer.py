@@ -612,13 +612,6 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         loss_ar = get_all_reduce_mean(loss_ar)
         loss_close = get_all_reduce_mean(loss_close)
         
-        if self.args.tune_backbone_only:
-            if self.global_step / len(self.train_dataloader) >= 1:
-                self.model.oa_layer.requires_grad_(True)
-                if not self.model.additional_layer:
-                    self.model.base_model.layers[-1].requires_grad_(True)
-                    self.model.base_model.oa_layer.requires_grad_(True)
-        
         dist.barrier()
         
         if replace_ratio > 0:

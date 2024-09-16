@@ -43,6 +43,7 @@ from oa_dag.datasets.raw.logieval import (
     ReclorDataset, ALDataset,
     ControlDataset, ConjNLIDataset,
 )
+from oa_dag.datasets.raw.code import MagiCoderTrainDataset, HumanEvalDataset
 
 
 __all__ = [
@@ -86,4 +87,7 @@ __all__ = [
     'ALDataset',
     'ControlDataset', 
     'ConjNLIDataset',
+    
+    'MagiCoderTrainDataset',
+    'HumanEvalDataset',
 ]
