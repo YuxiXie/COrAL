@@ -386,7 +386,10 @@ def corrupt_context(cur_input_ids: torch.LongTensor, cur_labels: torch.LongTenso
                 cur_labels = torch.cat((cur_labels, gt_context), dim=-1)
                 cur_inject_cnt += 1
             elif random.random() < context_inject_ratio:
-                cur_input_ids = torch.cat((cur_input_ids, gt_context), dim=-1)
+                if random.random() < .5:
+                    cur_input_ids = torch.cat((cur_input_ids, gt_context[0].unsqueeze(-1).expand(gt_context.size(-1))), dim=-1)
+                else:
+                    cur_input_ids = torch.cat((cur_input_ids, gt_context), dim=-1)
                 cur_labels = torch.cat((cur_labels, gt_context), dim=-1)
                 cur_inject_cnt += 1
             else:
