@@ -34,7 +34,7 @@ from oa_dag.configs.constants import IGNORE_INDEX
 
 logger = logging.get_logger(__name__)
 
-def apply_rotary_pos_emb_single(x, cos, sin, position_ids, unsqueeze_dim=1):
+def apply_rotary_pos_emb_single(x, cos, sin, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors.
 
     Args:
@@ -55,12 +55,9 @@ def apply_rotary_pos_emb_single(x, cos, sin, position_ids, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
-    if cos.dim() > 2:
-        cos = cos[0][position_ids].unsqueeze(unsqueeze_dim)
-        sin = sin[0][position_ids].unsqueeze(unsqueeze_dim)
-    else:
-        cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-        sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+    # cos = cos[position_ids].unsqueeze(unsqueeze_dim)
+    # sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+    cos, sin = cos.unsqueeze(unsqueeze_dim), sin.unsqueeze(unsqueeze_dim)
     x_embed = (x * cos) + (rotate_half(x) * sin)
     return x_embed
 
@@ -239,16 +236,17 @@ class LlamaSdpaAttentionOA(LlamaAttentionOA):
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
         # prepare cos & sin for positional encoding
         seq_len = (max(position_ids.max().item(), position_ids_to_predict.max().item()) if position_ids_to_predict is not None else position_ids.max().item()) + 1
-        # tmp_position_ids = torch.arange(0, seq_len, dtype=torch.long, device=position_ids.device).unsqueeze(0).expand(position_ids.size(0), seq_len)
-        cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
-        # cos, sin = self.rotary_emb(value_states, tmp_position_ids)
-
+        # cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
+        tmp_position_ids = torch.arange(0, seq_len, dtype=torch.long, device=position_ids.device).unsqueeze(0).expand(position_ids.size(0), seq_len)
+        cos, sin = self.rotary_emb(value_states, tmp_position_ids)
+        cos, sin = cos[0], sin[0]
+        
         if position_ids_to_predict is not None:
             # position embedding for last layer
-            key_states = apply_rotary_pos_emb_single(key_states, cos, sin, position_ids)
+            key_states = apply_rotary_pos_emb_single(key_states, cos[position_ids], sin[position_ids])
         else:
             # original position embedding
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos[position_ids], sin[position_ids])
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
@@ -268,7 +266,7 @@ class LlamaSdpaAttentionOA(LlamaAttentionOA):
             # (B, n_head, L, Wf+Wb+1, n_dim) --> (B, n_head, L * (Wf+Wb+1), n_dim)
             new_query_states = query_states.unsqueeze(-2).expand(bsz, query_states.size(1), q_len, position_ids_to_predict.size(-1), query_states.size(-1)).contiguous().view(bsz, query_states.size(1), -1, query_states.size(-1))
             # apply position encoding
-            query_states = apply_rotary_pos_emb_single(new_query_states, cos, sin, position_ids_to_predict.view(bsz, -1))
+            query_states = apply_rotary_pos_emb_single(new_query_states, cos[position_ids_to_predict.view(bsz, -1)], sin[position_ids_to_predict.view(bsz, -1)])
             
             if attention_mask is not None:
                 # update attention mask

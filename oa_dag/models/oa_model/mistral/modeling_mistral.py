@@ -53,12 +53,8 @@ def apply_rotary_pos_emb_single(x, cos, sin, position_ids, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
-    if cos.dim() > 2:
-        cos = cos[0][position_ids].unsqueeze(unsqueeze_dim)
-        sin = sin[0][position_ids].unsqueeze(unsqueeze_dim)
-    else:
-        cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-        sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
+    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
     x_embed = (x * cos) + (rotate_half(x) * sin)
     return x_embed
 
@@ -207,7 +203,7 @@ class MistralSdpaAttentionOA(MistralAttentionOA):
         # tmp_position_ids = torch.arange(0, seq_len, dtype=torch.long, device=position_ids.device).unsqueeze(0).expand(position_ids.size(0), seq_len)
         cos, sin = self.rotary_emb(value_states, seq_len=seq_len)
         # cos, sin = self.rotary_emb(value_states, tmp_position_ids)
-
+        
         if position_ids_to_predict is not None:
             # position embedding for last layer
             key_states = apply_rotary_pos_emb_single(key_states, cos, sin, position_ids)
