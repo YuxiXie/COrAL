@@ -83,6 +83,11 @@ def parse_arguments() -> argparse.Namespace:
     # Training
     training_parser = parser.add_argument_group('training')
     training_parser.add_argument(
+        '--multi_context_granularity',
+        default=False,
+        action='store_true',
+    )
+    training_parser.add_argument(
         '--corrupt_context_num',
         default=8,
         type=int,

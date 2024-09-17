@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import random
 from argparse import Namespace
 from typing import Any
 from tqdm import tqdm
@@ -20,6 +19,7 @@ from oa_dag.configs.constants import IGNORE_INDEX
 from oa_dag.datasets import SupervisedDataset, PromptOnlyDataset
 from oa_dag.trainers import SupervisedTrainer
 from oa_dag.utils import (
+    random,
     shuffle_and_mask, add_noise,
     get_variable_generator, pad_tensors, 
     get_all_reduce_mean, get_all_reduce_min,
@@ -369,7 +369,9 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             # patition into contexts
             label_start_idx = label_position_ids[0].item()
             # context_size = max(2, label_position_ids.size(-1) // self.args.corrupt_context_num)
-            context_size = min(self.backward_context_window // 1, max(2, label_position_ids.size(-1) // self.args.corrupt_context_num))
+            context_size = min(self.backward_context_window // 2, max(2, label_position_ids.size(-1) // self.args.corrupt_context_num))
+            if self.args.multi_context_granularity:
+                context_size = random.choice([i + 1 for i in range(context_size)])
             num_contexts = (label_position_ids.size(-1) + context_size - 1) // context_size
             ##=== initialize input ids with position info ===##
             cur_input_ids = input_ids[i].clone()[:label_start_idx]
@@ -398,8 +400,6 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         position_ids_to_predict = pad_tensors(position_ids_to_predict, pad_value=0)[:, :self.args.max_length, ...].contiguous()
         labels_to_predict = pad_tensors(labels_to_predict)[:, :self.args.max_length, ...].contiguous()
         
-        print(self.tokenizer.decode(new_input_ids[0], skip_special_tokens=True))
-        print(self.tokenizer.decode(input_ids[0], skip_special_tokens=True))
         replace_threshold = torch.stack(replace_threshold_list, dim=0).mean()
         replace_ratio = torch.stack(replace_ratio_list, dim=0).mean()
         
