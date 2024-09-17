@@ -369,7 +369,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             # patition into contexts
             label_start_idx = label_position_ids[0].item()
             # context_size = max(2, label_position_ids.size(-1) // self.args.corrupt_context_num)
-            context_size = min(self.backward_context_window // 2, max(2, label_position_ids.size(-1) // self.args.corrupt_context_num))
+            context_size = min(self.args.max_corrupt_context_size, max(2, label_position_ids.size(-1) // self.args.corrupt_context_num))
             if self.args.multi_context_granularity:
                 context_size = random.choice([i + 1 for i in range(context_size)])
             num_contexts = (label_position_ids.size(-1) + context_size - 1) // context_size
