@@ -764,20 +764,19 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
         block_size: int = 16,
         forward_size: int = 4,
         backward_size: int = 8,
-        eval_forward_size: int = 1,
-        eval_backward_size: int = 2,
+        eval_forward_size: int = 4,
+        eval_backward_size: int = 4,
         occurance_threshold: int = 8,
         topk: int = 16,
         topp: float = .99,
         max_iter_times: int = 512,
-        last_iter_times: int = 4,
         verbal: bool = False,
     ):
         # import time
         
         processors = LogitsProcessorList()
         # processors.append(TopPLogitsWarper(top_p=topp, min_tokens_to_keep=1))
-        processors.append(EtaLogitsWarper(epsilon=1-topp))
+        # processors.append(EtaLogitsWarper(epsilon=1-topp))
         # greedy_processors = LogitsProcessorList()
         # greedy_processors.append(TopKLogitsWarper(top_k=1, min_tokens_to_keep=1))
         
@@ -787,8 +786,8 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
         pred_start_pos = fixed_seq_length = seq_length
         occurance_counts = torch.ones_like(input_ids)  # record the occurance times of predicted tokens
         iter_cnt_last, iter_cnt_mid, prev_max_start_idx = 0, 0, -1
+        accept_ratios = None
         while keep_generate:
-            # stime = time.time()
             outputs: OAModelOutput = self(
                 input_ids=input_ids,    # (1, L)
                 attention_mask=torch.ones_like(input_ids).bool(),    # (1, L)
@@ -798,7 +797,6 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
             )
             logits = outputs.logits.contiguous().view(batch_size, input_ids.size(-1), position_ids_to_predict.size(-1), -1)     # (1, L * N, V) --> (1, L, N, V)
             logits = logits[:, seq_length - 1:, ...].contiguous()    # (1, L, N, V) --> (1, L', N, V)
-            # print('[F1]', time.time() - stime)
             
             pred_start_pos = fixed_seq_length
             pred_end_pos = position_ids_to_predict.max().item()
@@ -819,20 +817,19 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
                     processors=processors,
                     topk=topk,
                     max_length=max_length,
+                    accept_conf=accept_ratios,
                 )
             # print('[P1]', time.time() - stime)
             
-            # stime = time.time()
             candidate_logits = self(
                 input_ids=cur_input_ids.unsqueeze(0),
                 attention_mask=cur_attention_mask.unsqueeze(0).unsqueeze(0),
                 position_ids=cur_position_ids.unsqueeze(0),
                 position_ids_to_predict=cur_position_ids_to_predict.unsqueeze(0),
             ).logits.view(cur_input_ids.size(-1), -1, logits.size(-1))  # (Lt, W, V)
-            # print('[F2]', time.time() - stime)
             
             # stime = time.time()
-            losses, losses_gap, nt_losses, candidates = calculate_candidate_losses(
+            token_losses, token_losses_forward, token_nt_losses, accept_flags, candidates = calculate_candidate_losses(
                 cur_input_ids=cur_input_ids,
                 cur_position_ids_to_predict=cur_position_ids_to_predict,
                 candidate_logits=candidate_logits,
@@ -842,14 +839,19 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
                 forward_size=eval_forward_size,
                 backward_size=eval_backward_size,
             )
-            # losses, all_losses = nt_losses, losses
+            losses, losses_forward, nt_losses = token_losses.mean(-1), token_losses_forward.mean(-1), token_nt_losses.mean(-1)
+            losses_gap = nt_losses - losses_forward
+            losses_gap = losses_gap.masked_fill(losses_gap.lt(0), 0)
+            losses, all_losses = losses + losses_gap, losses
             # print('[P2]', time.time() - stime)
             
             tokens = candidates[losses.min(dim=-1).indices].contiguous().view(batch_size, -1)   # (1, T)
             new_input_ids = torch.cat((input_ids[:, :pred_start_pos], tokens), dim=-1)
-            # candidates = candidates[all_losses.sort(dim=-1).indices]
-            # candidates = candidates[losses_gap.sort(dim=-1).indices]
-            # candidates = candidates[losses.sort(dim=-1).indices]
+            accept_ratios = accept_flags[losses.min(dim=-1).indices]
+            # tokenizer.batch_decode(candidates[all_losses.sort(dim=-1).indices])
+            # tokenizer.batch_decode(candidates[losses_gap.sort(dim=-1).indices])
+            # tokenizer.batch_decode(candidates[nt_losses.sort(dim=-1).indices])
+            # tokenizer.batch_decode(candidates[losses.sort(dim=-1).indices])
             
             # EOS
             eos_idx = new_input_ids[0].eq(tokenizer.eos_token_id).nonzero().squeeze(-1)
@@ -864,6 +866,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
             if verbal:
                 iter_cnt = len(tracks)
                 print(f'[{iter_cnt}]', tokenizer.decode(new_input_ids[0].clone()))
+                print(accept_ratios.tolist())
             
             # convergence check
             min_seq_length = min(new_input_ids.size(-1), input_ids.size(-1))
@@ -873,33 +876,34 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
             tmp_occurance_counts[0, :diff_idx] = occurance_counts[0, :diff_idx] + 1
             occurance_counts = tmp_occurance_counts     # (B, L*) update the occurance times
             
+            rand_var = torch.rand(accept_ratios.size(-1), device=accept_ratios.device)
+            reject_indexes = accept_ratios.lt(rand_var).nonzero().squeeze(-1)
+            accept_idx = reject_indexes[0] + fixed_seq_length if reject_indexes.size(-1) > 0 else occurance_counts.size(-1)
+            accept_idx = (pred_start_pos + reject_indexes.min()).item() if reject_indexes.size(-1) > 0 else occurance_counts.size(-1)
+            
             few_times_indexes = occurance_counts[0, fixed_seq_length:].le(occurance_threshold).nonzero().squeeze(-1)
             few_times_idx = few_times_indexes[0] + fixed_seq_length if few_times_indexes.size(-1) > 0 else occurance_counts.size(-1)
             few_times_idx = (pred_start_pos + few_times_indexes.min()).item() if few_times_indexes.size(-1) > 0 else occurance_counts.size(-1)
             
-            # occurance_gaps = occurance_counts[0][:-1] - occurance_counts[0][1:]
-            # large_gap_idx = occurance_gaps[fixed_seq_length:].ge(occurance_threshold).nonzero().squeeze(-1)
-            # if large_gap_idx.size(-1) > 0:
-            #     large_gap_idx = large_gap_idx[0] + fixed_seq_length + 1
-            #     # fixed_seq_length = max(large_gap_idx, fixed_seq_length)
-            fixed_seq_length = min(few_times_idx, max(fixed_seq_length, new_input_ids.size(-1) - block_size + forward_size))
+            # fixed_seq_length = min(few_times_idx, accept_idx, max(fixed_seq_length, new_input_ids.size(-1) - block_size + forward_size))
+            fixed_seq_length = min(accept_idx, max(fixed_seq_length, new_input_ids.size(-1) - block_size + forward_size))
             start_idx, end_idx = fixed_seq_length, fixed_seq_length + block_size
             
             if start_idx <= prev_max_start_idx:
                 iter_cnt_mid += 1
             else:
                 iter_cnt_mid = 0
-            if iter_cnt_mid > last_iter_times:
+            if iter_cnt_mid > occurance_threshold:
                 fixed_seq_length = start_idx = min(prev_max_start_idx + 1, new_input_ids.size(-1))
                 end_idx = prev_max_start_idx + 1 + block_size
                 iter_cnt_mid = 0
             prev_max_start_idx = max(prev_max_start_idx, start_idx)
-            print(input_ids.size(-1), new_input_ids.size(-1), start_idx, end_idx, prev_max_start_idx)
-            if (new_input_ids[0].eq(tokenizer.eos_token_id).any() and few_times_idx >= eos_idx) or iter_cnt_last > last_iter_times or len(tracks) > max_iter_times:
+            
+            if (new_input_ids[0].eq(tokenizer.eos_token_id).any() and accept_idx >= eos_idx) or iter_cnt_last > occurance_threshold or len(tracks) > max_iter_times:
                 keep_generate = False
                 input_ids = new_input_ids
                 break
-            
+            # import ipdb; ipdb.set_trace()
             # update position_ids, position_ids_to_predict
             input_ids = new_input_ids
             if position_ids is not None:

@@ -604,30 +604,37 @@ def extract_logprobs_into_dict(
     pred_end_pos: int,
     forward_size: int = 4,
     backward_size: int = 8,
+    accept_conf: torch.FloatTensor = None,
 ):
     batch_size = input_ids.size(0)
     logprobs = logits.view(-1, logits.size(-1)).log_softmax(dim=-1).view(logits.size(1), -1, logits.size(-1)).unsqueeze(0)    # (1 * S, V) --> (1, L', N, V)
-    windwo_size = forward_size + backward_size + 1
+    window_size = forward_size + backward_size + 1
     target_seq_len = pred_end_pos - pred_start_pos + 1
     
+    if accept_conf is None:
+        accept_conf = torch.ones((logprobs.size(1),), device=logprobs.device)
+    elif accept_conf.size(-1) < logprobs.size(1):
+        accept_conf = torch.cat((torch.ones((logprobs.size(1) - accept_conf.size(-1),), device=logprobs.device), accept_conf), dim=-1)
+    accept_conf = accept_conf.cummin(-1).values + 1
+    
     # extract scores from logits
-    logprobs_dict = torch.zeros(batch_size, target_seq_len, windwo_size, logprobs.size(-1), dtype=logprobs.dtype, device=logprobs.device)  # (1, T, V)
-    weights = get_exp_dist(forward_size=forward_size, backward_size=backward_size).to(logprobs.device)
-    weights_dict = torch.zeros(batch_size, target_seq_len, windwo_size, dtype=weights.dtype, device=weights.device)  # (1, T, V)
+    logprobs_dict = torch.zeros(batch_size, target_seq_len, window_size, logprobs.size(-1), dtype=logprobs.dtype, device=logprobs.device)  # (1, T, V)
+    lambda_list = get_exp_dist(forward_size=forward_size, backward_size=backward_size).to(logprobs.device)
+    weights_dict = torch.zeros(batch_size, target_seq_len, window_size, dtype=lambda_list.dtype, device=lambda_list.device)  # (1, T, V)
     for i in range(batch_size):
-        for j in range(windwo_size):
+        for j in range(window_size):
             cur_positions_indexes = ref_position_ids_to_predict[i, :, j].ge(pred_start_pos).nonzero().squeeze(-1)
             if cur_positions_indexes.size(-1) <= 0: continue
             cur_positions = ref_position_ids_to_predict[i, cur_positions_indexes, j]
             
-            logprobs_dict[i, cur_positions - pred_start_pos, j] = logprobs[i, cur_positions_indexes, j] * weights[j]
-            weights_dict[i, cur_positions - pred_start_pos, j] = weights[j]
+            logprobs_dict[i, cur_positions - pred_start_pos, j] = logprobs[i, cur_positions_indexes, j] * accept_conf[cur_positions_indexes].unsqueeze(-1) * lambda_list[j]
+            weights_dict[i, cur_positions - pred_start_pos, j] = accept_conf[cur_positions_indexes] * lambda_list[j]
     
     ensemble_logits = logprobs_dict.sum(-2) / weights_dict.sum(-1).unsqueeze(-1)
     return logprobs_dict, ensemble_logits
 
 
-def create_tree_attention_mask(logprobs: torch.FloatTensor, forward_size: int = 1, topk: int = 16, maximum_seq_len: int = 100):
+def create_tree_attention_mask(logprobs: torch.FloatTensor, forward_size: int = 1, topk: int = 16, maximum_seq_len: int = 100, scale_factor: float = 16):
     n_depth = logprobs.size(0)
     results = torch.topk(logprobs.view(-1, logprobs.size(-1)), k=topk, dim=-1)
     topk = results.values.size(-1)
@@ -645,11 +652,7 @@ def create_tree_attention_mask(logprobs: torch.FloatTensor, forward_size: int = 
     confidence = results.values.clone()
     for i in range(forward_size):
         # scale last few tokens
-        confidence[-i - 1] = confidence[-i - 1] / (forward_size - i + topk - 1) * topk
-    # if n_depth > forward_size:
-        # scale_len = min(n_depth - forward_size, 3)
-        # confidence[:scale_len] = confidence[:scale_len] / max(forward_size - 1, 2)
-        # confidence[0] = confidence[0] / max(forward_size - 1, 2)
+        confidence[-i - 1] = confidence[-i - 1] / (forward_size - i + scale_factor - 1) * scale_factor
     confidence = confidence.exp()
     sorted_conf = confidence.view(-1).sort(descending=True)
     
@@ -803,10 +806,10 @@ def prepare_candidates(
     eval_backward_size: int = 8,
     processors: LogitsProcessorList = LogitsProcessorList(),
     topk: int = 16,
-    max_new_tokens = 256,
+    max_new_tokens = 512,
     max_length: int = 512,
+    accept_conf: torch.FloatTensor = None, 
 ):
-    # stime = time.time()
     # aggregate all predicted distributions
     _, ensemble_logits = extract_logprobs_into_dict(
         input_ids=input_ids,
@@ -816,18 +819,14 @@ def prepare_candidates(
         pred_end_pos=pred_end_pos,
         forward_size=forward_size,
         backward_size=backward_size,
+        accept_conf=accept_conf,
     )
     
     # sample and get candidate tokens
     token_scores = processors(input_ids, ensemble_logits.view(-1, ensemble_logits.size(-1)))  # (1 * T, V)
     logprobs = nn.functional.log_softmax(token_scores, dim=-1)  # (1 * T, V)
-    # token_scores = greedy_processors(input_ids, token_scores)
-    # tokens = torch.multinomial(token_scores.softmax(-1), num_samples=1).squeeze(-1).unsqueeze(0)
-    # print('[P1-1]', time.time() - stime)
     
-    # stime = time.time()
     # tree attention construction
-    max_new_tokens = min(max_new_tokens, max_length - pred_start_pos)
     candidate_ids, candidate_position_ids, tree_attn_mask, retrieve_indices = \
         create_tree_attention_mask(
             logprobs, 
@@ -836,9 +835,7 @@ def prepare_candidates(
             maximum_seq_len=max_new_tokens,
         )
     retrieve_indices = retrieve_indices + input_ids[0, :pred_start_pos].size(-1) - 1
-    # print('[P1-2]', time.time() - stime)
     
-    # stime = time.time()
     # tree attention input prepare
     cur_input_ids, cur_position_ids, cur_attention_mask, cur_position_ids_to_predict = \
         prepare_candidate_input_output(
@@ -851,9 +848,38 @@ def prepare_candidates(
             forward_size=eval_forward_size,
             backward_size=eval_backward_size,
         )
-    # print('[P1-3]', time.time() - stime)
     
     return cur_input_ids, cur_position_ids, cur_attention_mask, cur_position_ids_to_predict, retrieve_indices, logprobs
+
+
+def extract_accept_flags(scores: torch.FloatTensor, losses: torch.FloatTensor, epsilon: float=0.01, top_p: float=0.99):
+    try:
+        try:
+            epsilon = torch.tensor(epsilon)
+            
+            # Calculate the adaptive cutoff
+            probabilities = scores.softmax(dim=-1)
+            entropy = torch.distributions.Categorical(logits=scores).entropy()
+            eta = torch.min(epsilon, torch.sqrt(epsilon) * torch.exp(-entropy))[..., None]
+            indices_to_remove = probabilities < eta
+            
+            probabilities = probabilities.masked_fill(indices_to_remove, 2)
+            maxlosses = -probabilities.min(dim=-1).values.log()
+        except:
+            torch.cuda.empty_cache()
+            
+            sorted_logits = torch.sort(scores, descending=False).values
+            probabilities = sorted_logits.softmax(dim=-1)
+            cumulative_probs = probabilities.cumsum(dim=-1)
+            
+            # Remove tokens with cumulative top_p above the threshold (token with 0 are kept)
+            sorted_indices_to_remove = cumulative_probs <= (1 - top_p)
+            probabilities = probabilities.masked_fill(sorted_indices_to_remove, 2)
+            maxlosses = -probabilities.min(dim=-1).values.log()
+    except:
+        import ipdb; ipdb.set_trace()
+
+    return losses.le(maxlosses.view(losses.size(0), losses.size(1), -1)).to(losses.dtype)
 
 
 def calculate_candidate_losses(
@@ -882,12 +908,17 @@ def calculate_candidate_losses(
     candidates = torch.stack(candidates, dim=0).view(retrieve_indices.size(0), -1)
     # print('[P2-1]', time.time() - stime)
     
+    accept_flags = extract_accept_flags(shift_logits, shift_losses)
+    
     # stime = time.time()
     batch_size, target_seq_len = retrieve_indices.size(0), retrieve_indices.size(-1) - 1
     window_size = forward_size + backward_size + 1
     losses_dict = torch.zeros(batch_size, target_seq_len, window_size, dtype=shift_losses.dtype, device=shift_losses.device)  # (1, T, V)
-    weights = get_exp_dist(forward_size=forward_size, backward_size=backward_size).to(shift_losses.device)
-    weights_dict = torch.zeros(batch_size, target_seq_len, window_size, dtype=weights.dtype, device=weights.device)  # (1, T, V)
+    flags_dict = torch.zeros(batch_size, target_seq_len, window_size, dtype=shift_losses.dtype, device=shift_losses.device)  # (1, T, V)
+    lambda_list = get_exp_dist(forward_size=forward_size, backward_size=backward_size, forward_scale=1, backward_scale=1).to(shift_losses.device)
+    for i in range(forward_size - 1):
+        lambda_list[-i - 1] = 1 / lambda_list[-i - 1]
+    weights_dict = torch.zeros(batch_size, target_seq_len, window_size, dtype=lambda_list.dtype, device=lambda_list.device)  # (1, T, V)
     for i in range(batch_size):
         shift_losses_i, indices = shift_losses[i], retrieve_indices[i]
         cur_position_ids_to_predict_i = cur_position_ids_to_predict[indices]
@@ -896,14 +927,17 @@ def calculate_candidate_losses(
             if cur_positions_indexes.size(-1) <= 0: continue
             cur_positions = cur_position_ids_to_predict_i[cur_positions_indexes, j]
             
-            losses_dict[i, cur_positions - pred_start_pos, j] = shift_losses_i[cur_positions_indexes, j] * weights[j]
-            weights_dict[i, cur_positions - pred_start_pos, j] = weights[j]
-    losses = (losses_dict.sum(-1) / weights_dict.sum(-1)).mean(-1)
+            losses_dict[i, cur_positions - pred_start_pos, j] = shift_losses_i[cur_positions_indexes, j] * lambda_list[j]
+            flags_dict[i, cur_positions - pred_start_pos, j] = accept_flags[i, cur_positions_indexes, j]
+            weights_dict[i, cur_positions - pred_start_pos, j] = lambda_list[j]
     # print('[P2-2]', time.time() - stime)
     
-    losses_1 = (losses_dict[..., :backward_size + 2].sum(-1) / weights_dict[..., :backward_size + 2].sum(-1)).mean(-1)
+    losses_1 = losses_dict[..., :backward_size + 2].sum(-1) / weights_dict[..., :backward_size + 2].sum(-1)
     weights_2 = weights_dict[..., backward_size + 2:].sum(-1)
     weights_2 = weights_2.masked_fill(weights_2.eq(0), 1)
-    losses_2 = (losses_dict[..., backward_size + 2:].sum(-1) / weights_2).mean(-1)
+    losses_2 = losses_dict[..., backward_size + 2:].sum(-1) / weights_2
     
-    return losses, losses_1 - losses_2, losses_dict[..., backward_size + 1].mean(-1) / weights_dict[..., backward_size + 1].mean(-1), candidates
+    losses = losses_dict.sum(-1) / weights_dict.sum(-1)
+    accept_flags = flags_dict[..., :backward_size + 2].sum(-1) / weights_dict[..., :backward_size + 2].gt(0).sum(-1)
+    
+    return losses_1, losses_2, losses_dict[..., backward_size + 1] / weights_dict[..., backward_size + 1], accept_flags, candidates
