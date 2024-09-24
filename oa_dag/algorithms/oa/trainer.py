@@ -240,7 +240,8 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 text = self.tokenizer.batch_decode(batch['input_ids'], skip_special_tokens=True)
                 texts.extend(text)
                 if cnt % 10 == 0:
-                    json_dump({'prompts': texts, 'outputs': predictions, 'tracks': tracks}, f'{output_dir}/{self.args.result_fname}.json')
+                    json_dump({'prompts': texts, 'outputs': predictions, 'tracks': tracks, 'flops': self.flops, 'duration': self.durations}, 
+                              f'{output_dir}/{self.args.result_fname}.json')
             else:
                 loss = self.eval_step(**batch)
                 for pid, values in loss.items():
