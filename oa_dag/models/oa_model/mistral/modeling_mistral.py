@@ -765,7 +765,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
         forward_size: int = 4,
         backward_size: int = 8,
         eval_forward_size: int = 4,
-        eval_backward_size: int = 4,
+        eval_backward_size: int = 8,
         occurance_threshold: int = 8,
         topk: int = 16,
         topp: float = .99,

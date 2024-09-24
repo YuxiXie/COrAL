@@ -264,6 +264,21 @@ def parse_arguments() -> argparse.Namespace:
     # Evaluation
     evaluation_parser = parser.add_argument_group('evaluation')
     evaluation_parser.add_argument(
+        '--eval_forward_size',
+        type=int,
+        default=4,
+    )
+    evaluation_parser.add_argument(
+        '--eval_backward_size',
+        type=int,
+        default=4,
+    )
+    evaluation_parser.add_argument(
+        '--skip_verify',
+        default=False,
+        action='store_true',
+    )
+    evaluation_parser.add_argument(
         '--decoding_occurance_threshold',
         type=int,
         default=3,

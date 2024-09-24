@@ -138,6 +138,9 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 verbal=self.args.verbal_decoding,
                 left2right=self.args.left2right,
                 # add_denoising=self.args.add_denoising,
+                skip_verify=self.args.skip_verify,
+                eval_forward_size=self.args.eval_forward_size,
+                eval_backward_size=self.args.eval_backward_size,
             )
             self.durations.append(time.time() - stime)
             flops = calculate_flops_pipline.get_total_flops()
@@ -215,6 +218,10 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 self.args.result_fname = f'{self.args.result_fname}_tp{self.args.temperature}_stp{self.args.seq_temperature}_f{self.args.context_window}b{int(self.args.context_window * self.args.n_back_pred)}c{self.args.decoding_block_size}_t{self.args.decoding_occurance_threshold}'
             else:
                 self.args.result_fname = f'oa_tp{self.args.temperature}_stp{self.args.seq_temperature}_f{self.args.context_window}b{int(self.args.context_window * self.args.n_back_pred)}c{self.args.decoding_block_size}_t{self.args.decoding_occurance_threshold}'
+            if self.args.skip_verify:
+                self.args.result_fname += '_skip'
+            else:
+                self.args.result_fname += f'_{self.args.eval_forward_size}{self.args.eval_backward_size}eval'
         elif self.args.do_decoding:
             self.args.result_fname += f'_tp{self.args.temperature}'
         if os.path.exists(f'{output_dir}/{self.args.result_fname}.json'):
