@@ -771,14 +771,15 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
         topp: float = .99,
         max_iter_times: int = 512,
         verbal: bool = False,
+        skip_verify: bool = True,
     ):
-        # import time
+        import time
         
         processors = LogitsProcessorList()
         # processors.append(TopPLogitsWarper(top_p=topp, min_tokens_to_keep=1))
         # processors.append(EtaLogitsWarper(epsilon=1-topp))
-        # greedy_processors = LogitsProcessorList()
-        # greedy_processors.append(TopKLogitsWarper(top_k=1, min_tokens_to_keep=1))
+        greedy_processors = LogitsProcessorList()
+        greedy_processors.append(TopKLogitsWarper(top_k=1, min_tokens_to_keep=1))
         
         batch_size, seq_length = input_ids.size(0), input_ids.size(-1)
         start_idx, end_idx = seq_length, max_length - 1
@@ -802,9 +803,8 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
             pred_end_pos = position_ids_to_predict.max().item()
             ref_position_ids_to_predict = position_ids_to_predict[:, seq_length - 1:, :]    # (1, L', N)
             
-            # stime = time.time()
-            cur_input_ids, cur_position_ids, cur_attention_mask, cur_position_ids_to_predict, retrieve_indices, logprobs = \
-                prepare_candidates(
+            if skip_verify:
+                logprobs = prepare_candidates(
                     input_ids=input_ids,
                     logits=logits,
                     ref_position_ids_to_predict=ref_position_ids_to_predict,
@@ -818,36 +818,67 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
                     topk=topk,
                     max_length=max_length,
                     accept_conf=accept_ratios,
+                    skip_verify=skip_verify,
                 )
-            # print('[P1]', time.time() - stime)
+                token_scores = greedy_processors(input_ids, logprobs.exp())  # (1 * T, V)
+                probs = nn.functional.softmax(token_scores, dim=-1)  # (1 * T, V)
+                tokens = torch.multinomial(probs, num_samples=1).squeeze(-1).view(batch_size, -1)
+            else:
+                stime = time.time()
+                cur_input_ids, cur_position_ids, cur_attention_mask, cur_position_ids_to_predict, retrieve_indices, logprobs = \
+                    prepare_candidates(
+                        input_ids=input_ids,
+                        logits=logits,
+                        ref_position_ids_to_predict=ref_position_ids_to_predict,
+                        pred_start_pos=pred_start_pos,
+                        pred_end_pos=pred_end_pos,
+                        forward_size=forward_size,
+                        backward_size=backward_size,
+                        eval_forward_size=eval_forward_size,
+                        eval_backward_size=eval_backward_size,
+                        processors=processors,
+                        topk=topk,
+                        max_length=max_length,
+                        accept_conf=accept_ratios,
+                    )
+                if verbal:
+                    print('[P1]', time.time() - stime)
+                
+                candidate_logits = self(
+                    input_ids=cur_input_ids.unsqueeze(0),
+                    attention_mask=cur_attention_mask.unsqueeze(0).unsqueeze(0),
+                    position_ids=cur_position_ids.unsqueeze(0),
+                    position_ids_to_predict=cur_position_ids_to_predict.unsqueeze(0),
+                ).logits.view(cur_input_ids.size(-1), -1, logits.size(-1))  # (Lt, W, V)
+                
+                stime = time.time()
+                token_losses, token_losses_forward, token_nt_losses, accept_flags, candidates = calculate_candidate_losses(
+                    cur_input_ids=cur_input_ids,
+                    cur_position_ids_to_predict=cur_position_ids_to_predict,
+                    candidate_logits=candidate_logits,
+                    retrieve_indices=retrieve_indices,
+                    pred_start_pos=pred_start_pos,
+                    pred_end_pos=pred_end_pos,
+                    forward_size=eval_forward_size,
+                    backward_size=eval_backward_size,
+                )
+                losses, losses_forward, nt_losses = token_losses.mean(-1), token_losses_forward.mean(-1), token_nt_losses.mean(-1)
+                losses_gap = nt_losses - losses_forward
+                losses_gap = losses_gap.masked_fill(losses_gap.lt(0), 0)
+                losses, all_losses = losses + losses_gap, losses
+                first_token_accept_flags = accept_flags[:, 0].ge(min(accept_flags[:, 0].max().item(), .5))
             
-            candidate_logits = self(
-                input_ids=cur_input_ids.unsqueeze(0),
-                attention_mask=cur_attention_mask.unsqueeze(0).unsqueeze(0),
-                position_ids=cur_position_ids.unsqueeze(0),
-                position_ids_to_predict=cur_position_ids_to_predict.unsqueeze(0),
-            ).logits.view(cur_input_ids.size(-1), -1, logits.size(-1))  # (Lt, W, V)
-            
-            # stime = time.time()
-            token_losses, token_losses_forward, token_nt_losses, accept_flags, candidates = calculate_candidate_losses(
-                cur_input_ids=cur_input_ids,
-                cur_position_ids_to_predict=cur_position_ids_to_predict,
-                candidate_logits=candidate_logits,
-                retrieve_indices=retrieve_indices,
-                pred_start_pos=pred_start_pos,
-                pred_end_pos=pred_end_pos,
-                forward_size=eval_forward_size,
-                backward_size=eval_backward_size,
-            )
-            losses, losses_forward, nt_losses = token_losses.mean(-1), token_losses_forward.mean(-1), token_nt_losses.mean(-1)
-            losses_gap = nt_losses - losses_forward
-            losses_gap = losses_gap.masked_fill(losses_gap.lt(0), 0)
-            losses, all_losses = losses + losses_gap, losses
-            # print('[P2]', time.time() - stime)
-            
-            tokens = candidates[losses.min(dim=-1).indices].contiguous().view(batch_size, -1)   # (1, T)
+                # sorted_losses = losses.sort(dim=-1)
+                # tmp_select_idx = first_token_accept_flags[sorted_losses.indices].nonzero().squeeze(-1)[0]
+                # select_idx = sorted_losses.indices[tmp_select_idx]
+                select_idx = losses.min(dim=-1).indices            
+                if verbal:
+                    print('[P2]', time.time() - stime)
+                    
+                tokens = candidates[select_idx].contiguous().view(batch_size, -1)   # (1, T)
+                accept_ratios = accept_flags[select_idx]
+                
             new_input_ids = torch.cat((input_ids[:, :pred_start_pos], tokens), dim=-1)
-            accept_ratios = accept_flags[losses.min(dim=-1).indices]
             # tokenizer.batch_decode(candidates[all_losses.sort(dim=-1).indices])
             # tokenizer.batch_decode(candidates[losses_gap.sort(dim=-1).indices])
             # tokenizer.batch_decode(candidates[nt_losses.sort(dim=-1).indices])
@@ -866,7 +897,8 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
             if verbal:
                 iter_cnt = len(tracks)
                 print(f'[{iter_cnt}]', tokenizer.decode(new_input_ids[0].clone()))
-                print(accept_ratios.tolist())
+                if not skip_verify:
+                    print(accept_ratios.tolist())
             
             # convergence check
             min_seq_length = min(new_input_ids.size(-1), input_ids.size(-1))
@@ -876,17 +908,22 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
             tmp_occurance_counts[0, :diff_idx] = occurance_counts[0, :diff_idx] + 1
             occurance_counts = tmp_occurance_counts     # (B, L*) update the occurance times
             
-            rand_var = torch.rand(accept_ratios.size(-1), device=accept_ratios.device)
-            reject_indexes = accept_ratios.lt(rand_var).nonzero().squeeze(-1)
-            accept_idx = reject_indexes[0] + fixed_seq_length if reject_indexes.size(-1) > 0 else occurance_counts.size(-1)
-            accept_idx = (pred_start_pos + reject_indexes.min()).item() if reject_indexes.size(-1) > 0 else occurance_counts.size(-1)
-            
-            few_times_indexes = occurance_counts[0, fixed_seq_length:].le(occurance_threshold).nonzero().squeeze(-1)
-            few_times_idx = few_times_indexes[0] + fixed_seq_length if few_times_indexes.size(-1) > 0 else occurance_counts.size(-1)
-            few_times_idx = (pred_start_pos + few_times_indexes.min()).item() if few_times_indexes.size(-1) > 0 else occurance_counts.size(-1)
+            if not skip_verify:
+                rand_var = torch.rand(accept_ratios.size(-1), device=accept_ratios.device)
+                reject_indexes = accept_ratios.lt(rand_var).nonzero().squeeze(-1)
+                accept_idx = reject_indexes[0] + fixed_seq_length if reject_indexes.size(-1) > 0 else occurance_counts.size(-1)
+                accept_idx = (pred_start_pos + reject_indexes.min()).item() if reject_indexes.size(-1) > 0 else occurance_counts.size(-1)
+            else:
+                few_times_indexes = occurance_counts[0, fixed_seq_length:].le(occurance_threshold).nonzero().squeeze(-1)
+                few_times_idx = few_times_indexes[0] + fixed_seq_length if few_times_indexes.size(-1) > 0 else occurance_counts.size(-1)
+                few_times_idx = (pred_start_pos + few_times_indexes.min()).item() if few_times_indexes.size(-1) > 0 else occurance_counts.size(-1)
+                accept_idx = few_times_idx
             
             # fixed_seq_length = min(few_times_idx, accept_idx, max(fixed_seq_length, new_input_ids.size(-1) - block_size + forward_size))
-            fixed_seq_length = min(accept_idx, max(fixed_seq_length, new_input_ids.size(-1) - block_size + forward_size))
+            # fixed_seq_length = min(accept_idx, max(fixed_seq_length, new_input_ids.size(-1) - block_size + forward_size))
+            # fixed_seq_length = max(accept_idx, fixed_seq_length + 1)
+            if tokens.size(-1) >= min(backward_size, block_size):
+                fixed_seq_length = max(accept_idx, fixed_seq_length)
             start_idx, end_idx = fixed_seq_length, fixed_seq_length + block_size
             
             if start_idx <= prev_max_start_idx:
@@ -899,7 +936,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
                 iter_cnt_mid = 0
             prev_max_start_idx = max(prev_max_start_idx, start_idx)
             
-            if (new_input_ids[0].eq(tokenizer.eos_token_id).any() and accept_idx >= eos_idx) or iter_cnt_last > occurance_threshold or len(tracks) > max_iter_times:
+            if (new_input_ids[0].eq(tokenizer.eos_token_id).any() and (accept_idx >= eos_idx)) or start_idx >= max_length or iter_cnt_last > forward_size or len(tracks) > max_iter_times:
                 keep_generate = False
                 input_ids = new_input_ids
                 break

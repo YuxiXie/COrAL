@@ -45,4 +45,19 @@ class HumanEvalDataset(MagiCoderDataset):
         input = 'Complete the code below:\n\n{}'.format(data['prompt'])
         answer = 'Here is the final code:\n\n{}{}'.format(data['prompt'], data['canonical_solution'])
         return RawSample(input=input, answer=answer)
+
+
+class MBPPTestDataset(MagiCoderDataset):
+    NAME: str = 'MBPP/test'
+    PATH: str = 'google-research-datasets/mbpp'
+    SPLIT: str = 'test'
     
+    def __init__(self, path: str | None = None) -> None:
+        self.data = load_dataset(path or self.PATH, split=self.SPLIT, trust_remote_code=True)
+    
+    def __getitem__(self, index: int) -> RawSample:
+        data = self.data[index]
+        input = 'You are an expert Python programmer, and here is your task:\n{}'.format(data['text'])
+        # input += '\nYour code should pass these tests:\n{}'.format('\n'.join(data['test_list']))
+        answer = data['code']
+        return RawSample(input=input, answer=answer)

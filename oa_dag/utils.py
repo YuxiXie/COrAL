@@ -763,8 +763,7 @@ def prepare_candidate_input_output(
     
     cur_position_ids_to_predict = position_ids_to_predict[cur_position_ids]
     cur_position_ids_to_predict[:pred_start_pos - 1, :] = 0
-    
-    cur_attention_mask = torch.tril(torch.ones((cur_input_ids.size(-1), cur_input_ids.size(-1)))).bool().to(cur_input_ids.device)
+    cur_attention_mask = torch.tril(torch.ones((cur_input_ids.size(-1), cur_input_ids.size(-1)), dtype=torch.bool, device=cur_input_ids.device))
     cur_attention_mask[-candidate_ids.size(-1) - 1:, -candidate_ids.size(-1) - 1:] = tree_attn_mask
     
     return cur_input_ids, cur_position_ids, cur_attention_mask, cur_position_ids_to_predict
@@ -809,9 +808,10 @@ def prepare_candidates(
     eval_backward_size: int = 8,
     processors: LogitsProcessorList = LogitsProcessorList(),
     topk: int = 16,
-    max_new_tokens = 512,
+    max_new_tokens = 128,
     max_length: int = 512,
     accept_conf: torch.FloatTensor = None, 
+    skip_verify: bool = False,
 ):
     # aggregate all predicted distributions
     _, ensemble_logits = extract_logprobs_into_dict(
@@ -828,6 +828,9 @@ def prepare_candidates(
     # sample and get candidate tokens
     token_scores = processors(input_ids, ensemble_logits.view(-1, ensemble_logits.size(-1)))  # (1 * T, V)
     logprobs = nn.functional.log_softmax(token_scores, dim=-1)  # (1 * T, V)
+    
+    if skip_verify:
+        return logprobs
     
     # tree attention construction
     candidate_ids, candidate_position_ids, tree_attn_mask, retrieve_indices = \
@@ -895,7 +898,6 @@ def calculate_candidate_losses(
     forward_size: int = 4,
     backward_size: int = 8,
 ):
-    # stime = time.time()
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     shift_logits, shift_labels, candidates = [], [], []
     for indices in retrieve_indices:
@@ -909,11 +911,9 @@ def calculate_candidate_losses(
     shift_logits, shift_labels = torch.stack(shift_logits, dim=0).view(-1, candidate_logits.size(-1)), torch.stack(shift_labels, dim=0).view(-1)
     shift_losses = loss_fct(shift_logits, shift_labels).view(retrieve_indices.size(0), retrieve_indices.size(-1), -1)
     candidates = torch.stack(candidates, dim=0).view(retrieve_indices.size(0), -1)
-    # print('[P2-1]', time.time() - stime)
     
     accept_flags = extract_accept_flags(shift_logits, shift_losses)
     
-    # stime = time.time()
     batch_size, target_seq_len = retrieve_indices.size(0), retrieve_indices.size(-1) - 1
     window_size = forward_size + backward_size + 1
     losses_dict = torch.zeros(batch_size, target_seq_len, window_size, dtype=shift_losses.dtype, device=shift_losses.device)  # (1, T, V)
@@ -933,7 +933,6 @@ def calculate_candidate_losses(
             losses_dict[i, cur_positions - pred_start_pos, j] = shift_losses_i[cur_positions_indexes, j] * lambda_list[j]
             flags_dict[i, cur_positions - pred_start_pos, j] = accept_flags[i, cur_positions_indexes, j]
             weights_dict[i, cur_positions - pred_start_pos, j] = lambda_list[j]
-    # print('[P2-2]', time.time() - stime)
     
     losses_1 = losses_dict[..., :backward_size + 2].sum(-1) / weights_dict[..., :backward_size + 2].sum(-1)
     weights_2 = weights_dict[..., backward_size + 2:].sum(-1)

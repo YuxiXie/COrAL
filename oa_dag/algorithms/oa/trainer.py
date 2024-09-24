@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from argparse import Namespace
 from typing import Any
 from tqdm import tqdm
@@ -31,6 +32,7 @@ from oa_dag.utils import (
 
 from oa_dag.models.oa_model import AutoModelForOA, OAModelOutput
 
+from calflops.calculate_pipline import CalFlopsPipline
 
 class OASupervisedFinetuneTrainer(SupervisedTrainer):
     """Trainer class for supervised finetuning."""
@@ -54,6 +56,8 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         self.replace_sampler = LogitsProcessorList()
         self.replace_sampler.append(TopKLogitsWarper(top_k=16))
         self.replace_sampler.append(TemperatureLogitsWarper(temperature=4.0))
+        
+        self.flops, self.durations = [], []
     
     def init_models(self) -> None:
         """Initialize model and tokenizer."""
@@ -117,6 +121,9 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             self.args.reconstruct = False
         
         if self.args.do_decoding:
+            calculate_flops_pipline = CalFlopsPipline(model=self.model,include_backPropagation=False,compute_bp_factor=2)
+            calculate_flops_pipline.start_flops_calculate(ignore_list=None)
+            stime = time.time()
             tracks = self.model.module.oa_generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -132,6 +139,10 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 left2right=self.args.left2right,
                 # add_denoising=self.args.add_denoising,
             )
+            self.durations.append(time.time() - stime)
+            flops = calculate_flops_pipline.get_total_flops()
+            self.flops.append(flops)
+            calculate_flops_pipline.end_flops_calculate()
             dist.barrier()
             return tracks
         else:
@@ -230,7 +241,8 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                     counts[pid].append(values[1])
 
         if self.args.do_decoding:
-            json_dump({'prompts': texts, 'outputs': predictions, 'tracks': tracks}, f'{output_dir}/{self.args.result_fname}.json')
+            json_dump({'prompts': texts, 'outputs': predictions, 'tracks': tracks, 'flops': self.flops, 'duration': self.durations}, 
+                      f'{output_dir}/{self.args.result_fname}.json')
             import ipdb; ipdb.set_trace()
         else:
             # Gather results from all processes

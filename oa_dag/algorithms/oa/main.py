@@ -84,7 +84,7 @@ def parse_arguments() -> argparse.Namespace:
     training_parser = parser.add_argument_group('training')
     training_parser.add_argument(
         '--max_corrupt_context_size',
-        default=6,
+        default=4,
         type=int,
     )
     training_parser.add_argument(
