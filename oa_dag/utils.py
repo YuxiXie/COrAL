@@ -513,17 +513,19 @@ def get_hyperbolic_dist(forward_size=4, backward_size=8, downweight=2e-5):
     return x
 
 
-def get_exp_dist(forward_size=4, backward_size=8, forward_scale=8, backward_scale=1/8):
-    x_forward = torch.arange(0, forward_size)
+def get_exp_dist(forward_size=4, backward_size=8, forward_scale=8, backward_scale=1/8, reverse_forward=False, device='cpu'):
+    x_forward = torch.arange(0, forward_size, device=device)
     x_forward = (-forward_scale * x_forward).exp()
+    if reverse_forward and len(x_forward) > 1:
+        x_forward = torch.cat((x_forward[:1], 1/x_forward[1:]), dim=-1)
     
     if backward_size < 0:
         return x_forward
     if backward_size < 1:
         return torch.cat((x_forward[:1]/10, x_forward), dim=-1)
     
-    x_backward = -torch.arange(0, backward_size - 1) + backward_size - 2
-    x_backward = torch.cat((x_backward, torch.arange(1, 3)), dim=-1)
+    x_backward = -torch.arange(0, backward_size - 1, device=device) + backward_size - 2
+    x_backward = torch.cat((x_backward, torch.arange(1, 3, device=device)), dim=-1)
     x_backward = (-backward_scale * x_backward).exp()[-backward_size - 1:]
     
     return torch.cat((x_backward, x_forward), dim=-1)
@@ -622,7 +624,7 @@ def extract_logprobs_into_dict(
     
     # extract scores from logits
     logprobs_dict = torch.zeros(batch_size, target_seq_len, window_size, logprobs.size(-1), dtype=logprobs.dtype, device=logprobs.device)  # (1, T, V)
-    lambda_list = get_exp_dist(forward_size=forward_size, backward_size=backward_size).to(logprobs.device)
+    lambda_list = get_exp_dist(forward_size=forward_size, backward_size=backward_size, device=logprobs.device)
     weights_dict = torch.zeros(batch_size, target_seq_len, window_size, dtype=lambda_list.dtype, device=lambda_list.device)  # (1, T, V)
     for i in range(batch_size):
         for j in range(window_size):
@@ -858,14 +860,17 @@ def prepare_candidates(
     return cur_input_ids, cur_position_ids, cur_attention_mask, cur_position_ids_to_predict, retrieve_indices, logprobs
 
 
-def extract_accept_flags(scores: torch.FloatTensor, losses: torch.FloatTensor, epsilon: float=0.2, top_p: float=0.9):
+def extract_accept_flags(scores: torch.FloatTensor, losses: torch.FloatTensor, epsilon: float=0.2, top_p: float=0.6):
     try:
         try:
             epsilon = torch.tensor(epsilon)
             
             # Calculate the adaptive cutoff
             probabilities = scores.softmax(dim=-1)
-            entropy = torch.distributions.Categorical(logits=scores).entropy()
+            # entropy = torch.distributions.Categorical(logits=scores).entropy()
+            entropy = -torch.sum(
+                probabilities * torch.log(probabilities + 1e-5), dim=-1
+            )
             eta = torch.min(epsilon, torch.sqrt(epsilon) * torch.exp(-entropy))[..., None]
             indices_to_remove = probabilities < eta
             
@@ -885,7 +890,7 @@ def extract_accept_flags(scores: torch.FloatTensor, losses: torch.FloatTensor, e
     except:
         import ipdb; ipdb.set_trace()
 
-    return losses.le(maxlosses.view(losses.size(0), losses.size(1), -1)).to(losses.dtype)
+    return losses.le(maxlosses.view(losses.size(0), losses.size(1), -1))
 
 
 def calculate_candidate_losses(
@@ -900,40 +905,35 @@ def calculate_candidate_losses(
     epsilon: float = 0.1,
 ):
     loss_fct = nn.CrossEntropyLoss(reduction='none')
-    shift_logits, shift_labels, candidates = [], [], []
-    for indices in retrieve_indices:
-        shift_logits.append(candidate_logits[indices])
-        labels_i = cur_input_ids[indices].clone()
-        labels_i[0] = IGNORE_INDEX
-        positions_i = cur_position_ids_to_predict[indices] - pred_start_pos + 1
-        positions_i = positions_i.masked_fill(positions_i.lt(1), 0)
-        shift_labels.append(labels_i[positions_i])
-        candidates.append(cur_input_ids[indices][1:])
-    shift_logits, shift_labels = torch.stack(shift_logits, dim=0).view(-1, candidate_logits.size(-1)), torch.stack(shift_labels, dim=0).view(-1)
+    
+    shift_logits = candidate_logits[retrieve_indices].view(-1, candidate_logits.size(-1))
+    cur_labels = cur_input_ids.clone()
+    cur_labels[:pred_start_pos] = IGNORE_INDEX
+    positions_i = cur_position_ids_to_predict[retrieve_indices[0]] - pred_start_pos + 1
+    positions_i = positions_i.masked_fill(positions_i.lt(1), 0)
+    shift_labels = cur_labels[retrieve_indices][:, positions_i].view(-1)
     shift_losses = loss_fct(shift_logits, shift_labels).view(retrieve_indices.size(0), retrieve_indices.size(-1), -1)
-    candidates = torch.stack(candidates, dim=0).view(retrieve_indices.size(0), -1)
+    candidates = cur_input_ids[retrieve_indices][:, 1:]
     
     accept_flags = extract_accept_flags(shift_logits, shift_losses, epsilon=epsilon)
     
     batch_size, target_seq_len = retrieve_indices.size(0), retrieve_indices.size(-1) - 1
     window_size = forward_size + backward_size + 1
     losses_dict = torch.zeros(batch_size, target_seq_len, window_size, dtype=shift_losses.dtype, device=shift_losses.device)  # (1, T, V)
-    flags_dict = torch.zeros(batch_size, target_seq_len, window_size, dtype=shift_losses.dtype, device=shift_losses.device)  # (1, T, V)
-    lambda_list = get_exp_dist(forward_size=forward_size, backward_size=backward_size, forward_scale=1, backward_scale=1).to(shift_losses.device)
-    for i in range(forward_size - 1):
-        lambda_list[-i - 1] = 1 / lambda_list[-i - 1]
-    weights_dict = torch.zeros(batch_size, target_seq_len, window_size, dtype=lambda_list.dtype, device=lambda_list.device)  # (1, T, V)
-    for i in range(batch_size):
-        shift_losses_i, indices = shift_losses[i], retrieve_indices[i]
-        cur_position_ids_to_predict_i = cur_position_ids_to_predict[indices]
-        for j in range(window_size):
-            cur_positions_indexes = cur_position_ids_to_predict_i[:, j].ge(pred_start_pos).nonzero().squeeze(-1)
-            if cur_positions_indexes.size(-1) <= 0: continue
-            cur_positions = cur_position_ids_to_predict_i[cur_positions_indexes, j]
-            
-            losses_dict[i, cur_positions - pred_start_pos, j] = shift_losses_i[cur_positions_indexes, j] * lambda_list[j]
-            flags_dict[i, cur_positions - pred_start_pos, j] = accept_flags[i, cur_positions_indexes, j]
-            weights_dict[i, cur_positions - pred_start_pos, j] = lambda_list[j]
+    flags_dict = torch.zeros_like(losses_dict, dtype=accept_flags.dtype)  # (1, T, V)
+    lambda_list = get_exp_dist(forward_size=forward_size, backward_size=backward_size, forward_scale=1, backward_scale=1, reverse_forward=True, device=shift_losses.device)
+    weights_dict = torch.zeros_like(losses_dict, dtype=lambda_list.dtype)  # (1, T, V)
+    
+    positions_i = cur_position_ids_to_predict[retrieve_indices[0]]
+    positions_i_flags = positions_i.ge(pred_start_pos)
+    for j in range(window_size):
+        cur_positions_indexes = positions_i_flags[:, j].nonzero().squeeze(-1)
+        if cur_positions_indexes.size(-1) <= 0: continue
+        cur_positions = positions_i[cur_positions_indexes, j]
+        
+        losses_dict[:, cur_positions - pred_start_pos, j] = shift_losses[:, cur_positions_indexes, j] * lambda_list[j]
+        flags_dict[:, cur_positions - pred_start_pos, j] = accept_flags[:, cur_positions_indexes, j]
+        weights_dict[:, cur_positions - pred_start_pos, j] = lambda_list[j]
     
     losses_1 = losses_dict[..., :backward_size + 2].sum(-1) / weights_dict[..., :backward_size + 2].sum(-1)
     weights_2 = weights_dict[..., backward_size + 2:].sum(-1)

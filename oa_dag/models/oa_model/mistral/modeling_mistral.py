@@ -841,6 +841,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
                         topk=topk,
                         max_length=max_length,
                         accept_conf=accept_ratios,
+                        max_new_tokens=int(block_size * 4),
                     )
                 if verbal:
                     print('[P1]', time.time() - stime)
@@ -867,9 +868,9 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
                 losses, losses_forward, nt_losses = token_losses.mean(-1), token_losses_forward.mean(-1), token_nt_losses.mean(-1)
                 losses_gap = nt_losses - losses_forward
                 losses_gap = losses_gap.masked_fill(losses_gap.lt(0), 0)
-                losses, all_losses = losses + losses_gap, losses
-                first_token_accept_flags = accept_flags[:, 0].ge(min(accept_flags[:, 0].max().item(), .5))
-            
+                losses = losses + losses_gap
+                
+                # first_token_accept_flags = accept_flags[:, 0].ge(min(accept_flags[:, 0].max().item(), .5))
                 # sorted_losses = losses.sort(dim=-1)
                 # tmp_select_idx = first_token_accept_flags[sorted_losses.indices].nonzero().squeeze(-1)[0]
                 # select_idx = sorted_losses.indices[tmp_select_idx]
@@ -938,7 +939,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
                 iter_cnt_mid = 0
             prev_max_start_idx = max(prev_max_start_idx, start_idx)
             
-            if (new_input_ids[0].eq(tokenizer.eos_token_id).any() and (accept_idx >= eos_idx)) or start_idx >= max_length or iter_cnt_last > forward_size or len(tracks) > max_iter_times:
+            if (new_input_ids[0].eq(tokenizer.eos_token_id).any() and (accept_idx >= eos_idx)) or start_idx >= max_length or iter_cnt_last > backward_size or len(tracks) > max_iter_times:
                 keep_generate = False
                 input_ids = new_input_ids
                 break
