@@ -141,6 +141,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 skip_verify=self.args.skip_verify,
                 eval_forward_size=self.args.eval_forward_size,
                 eval_backward_size=self.args.eval_backward_size,
+                epsilon=self.args.epsilon,
             )
             self.durations.append(time.time() - stime)
             flops = calculate_flops_pipline.get_total_flops()
@@ -215,9 +216,9 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         cnt = 0
         if not self.args.left2right and self.args.do_decoding:
             if self.args.result_fname.startswith('oa'):
-                self.args.result_fname = f'{self.args.result_fname}_tp{self.args.temperature}_stp{self.args.seq_temperature}_f{self.args.context_window}b{int(self.args.context_window * self.args.n_back_pred)}c{self.args.decoding_block_size}_t{self.args.decoding_occurance_threshold}'
+                self.args.result_fname = f'{self.args.result_fname}_e{self.args.epsilon}_tp{self.args.temperature}_stp{self.args.seq_temperature}_f{self.args.context_window}b{int(self.args.context_window * self.args.n_back_pred)}c{self.args.decoding_block_size}_t{self.args.decoding_occurance_threshold}'
             else:
-                self.args.result_fname = f'oa_tp{self.args.temperature}_stp{self.args.seq_temperature}_f{self.args.context_window}b{int(self.args.context_window * self.args.n_back_pred)}c{self.args.decoding_block_size}_t{self.args.decoding_occurance_threshold}'
+                self.args.result_fname = f'oa_e{self.args.epsilon}_tp{self.args.temperature}_stp{self.args.seq_temperature}_f{self.args.context_window}b{int(self.args.context_window * self.args.n_back_pred)}c{self.args.decoding_block_size}_t{self.args.decoding_occurance_threshold}'
             if self.args.skip_verify:
                 self.args.result_fname += '_skip'
             else:

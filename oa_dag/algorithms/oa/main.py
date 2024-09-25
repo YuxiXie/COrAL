@@ -264,6 +264,11 @@ def parse_arguments() -> argparse.Namespace:
     # Evaluation
     evaluation_parser = parser.add_argument_group('evaluation')
     evaluation_parser.add_argument(
+        '--epsilon',
+        type=float,
+        default=0.1,
+    )
+    evaluation_parser.add_argument(
         '--eval_forward_size',
         type=int,
         default=4,

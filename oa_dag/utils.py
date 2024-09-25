@@ -858,7 +858,7 @@ def prepare_candidates(
     return cur_input_ids, cur_position_ids, cur_attention_mask, cur_position_ids_to_predict, retrieve_indices, logprobs
 
 
-def extract_accept_flags(scores: torch.FloatTensor, losses: torch.FloatTensor, epsilon: float=0.01, top_p: float=0.99):
+def extract_accept_flags(scores: torch.FloatTensor, losses: torch.FloatTensor, epsilon: float=0.2, top_p: float=0.9):
     try:
         try:
             epsilon = torch.tensor(epsilon)
@@ -897,6 +897,7 @@ def calculate_candidate_losses(
     pred_end_pos: int,
     forward_size: int = 4,
     backward_size: int = 8,
+    epsilon: float = 0.1,
 ):
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     shift_logits, shift_labels, candidates = [], [], []
@@ -912,7 +913,7 @@ def calculate_candidate_losses(
     shift_losses = loss_fct(shift_logits, shift_labels).view(retrieve_indices.size(0), retrieve_indices.size(-1), -1)
     candidates = torch.stack(candidates, dim=0).view(retrieve_indices.size(0), -1)
     
-    accept_flags = extract_accept_flags(shift_logits, shift_losses)
+    accept_flags = extract_accept_flags(shift_logits, shift_losses, epsilon=epsilon)
     
     batch_size, target_seq_len = retrieve_indices.size(0), retrieve_indices.size(-1) - 1
     window_size = forward_size + backward_size + 1

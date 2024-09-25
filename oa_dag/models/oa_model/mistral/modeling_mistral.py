@@ -772,6 +772,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
         max_iter_times: int = 512,
         verbal: bool = False,
         skip_verify: bool = True,
+        epsilon: float = 0.1,
     ):
         import time
         
@@ -861,6 +862,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
                     pred_end_pos=pred_end_pos,
                     forward_size=eval_forward_size,
                     backward_size=eval_backward_size,
+                    epsilon=epsilon,
                 )
                 losses, losses_forward, nt_losses = token_losses.mean(-1), token_losses_forward.mean(-1), token_nt_losses.mean(-1)
                 losses_gap = nt_losses - losses_forward
@@ -976,6 +978,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
         left2right: bool = False,
         verbal: bool = False,
         use_cache: bool = False,
+        epsilon: float = 0.1,
     ):
         batch_size, seq_length = input_ids.size(0), input_ids.size(-1)
         assert batch_size == 1, "Only support batch size 1 for now !!!"
@@ -1027,4 +1030,5 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
                 max_iter_times=max_iter_times,
                 verbal=verbal,
                 skip_verify=skip_verify,
+                epsilon=epsilon,
             )
