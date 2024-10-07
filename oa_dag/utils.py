@@ -59,6 +59,10 @@ def jsonlines_load(x):
         data = [r for r in reader]
     return data
 
+def jsonlines_dump(x, d):
+    with jsonlines.open(x, mode='w') as writer:
+        writer.write_all(d)
+
 
 def seed_everything(seed: int) -> None:
     """Set global random seed for reproducibility."""
@@ -371,11 +375,11 @@ def corrupt_context(cur_input_ids: torch.LongTensor, cur_labels: torch.LongTenso
     label_start_idx = raw_label_positions[0].item()
     keep_inject = True
     while keep_inject:
-        cur_inject_cnt = 0
+        cur_inject_cnt, prev_inject = 0, False
         context_inject_ratio = context_inject_ratio_generator.rvs(1)[0]
         for j in range(num_contexts):
             gt_context = raw_input_ids.clone()[raw_label_positions[j * context_size: (j + 1) * context_size]]
-            if random.random() < context_inject_ratio:
+            if random.random() < context_inject_ratio and not prev_inject:
                 fake_context_idx = random.randint(0, num_contexts - 1)
                 fake_context = raw_input_ids.clone()[raw_label_positions[fake_context_idx * context_size: (fake_context_idx + 1) * context_size]]
                 min_len = min(gt_context.size(-1), fake_context.size(-1))
@@ -385,21 +389,26 @@ def corrupt_context(cur_input_ids: torch.LongTensor, cur_labels: torch.LongTenso
                 cur_input_ids = torch.cat((cur_input_ids, fake_context), dim=-1)
                 cur_labels = torch.cat((cur_labels, gt_context), dim=-1)
                 cur_inject_cnt += 1
-            elif random.random() < context_inject_ratio:
+                prev_inject = True
+            elif random.random() < context_inject_ratio and not prev_inject:
                 if random.random() < .5:
                     cur_input_ids = torch.cat((cur_input_ids, gt_context[0].unsqueeze(-1).expand(gt_context.size(-1))), dim=-1)
+                    prev_inject = True
                 else:
                     cur_input_ids = torch.cat((cur_input_ids, gt_context), dim=-1)
+                    prev_inject = False
                 cur_labels = torch.cat((cur_labels, gt_context), dim=-1)
                 cur_inject_cnt += 1
             else:
                 cur_input_ids = torch.cat((cur_input_ids, gt_context), dim=-1)
                 cur_labels = torch.cat((cur_labels, torch.ones_like(gt_context, dtype=torch.long) * IGNORE_INDEX), dim=-1)
+                prev_inject = False
         if cur_inject_cnt > 0:
             keep_inject = False
         else:
             cur_input_ids = raw_input_ids.clone()[:label_start_idx]
             cur_labels = raw_labels.clone()[:label_start_idx]
+            prev_inject = False
     return cur_input_ids, cur_labels, cur_inject_cnt, context_inject_ratio
 
 

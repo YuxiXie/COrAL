@@ -236,7 +236,7 @@ class SupervisedTrainer(TrainerBase):
         for epoch in range(self.args.epochs):
             self.train_dataloader.sampler.set_epoch(epoch)
             if epoch < epochs_trained: continue
-            if self.args.tune_backbone_only and epoch > 0: break
+            # if self.args.tune_backbone_only and epoch > 0: break
 
             for batch, no_noise_batch in zip(self.train_dataloader, self.no_noise_train_dataloader):
                 if steps_trained_in_current_epoch > 0:

@@ -108,7 +108,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             config=ds_config,
         )
         return engine
-        
+    
     @torch.no_grad()
     def eval_step(
         self,
@@ -137,7 +137,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 occurance_threshold=self.args.decoding_occurance_threshold,
                 verbal=self.args.verbal_decoding,
                 left2right=self.args.left2right,
-                # add_denoising=self.args.add_denoising,
+                add_denoising=self.args.add_denoising,
                 skip_verify=self.args.skip_verify,
                 eval_forward_size=self.args.eval_forward_size,
                 eval_backward_size=self.args.eval_backward_size,
@@ -225,9 +225,11 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 self.args.result_fname += f'_{self.args.eval_forward_size}{self.args.eval_backward_size}eval'
         elif self.args.do_decoding:
             self.args.result_fname += f'_tp{self.args.temperature}'
+        self.args.result_fname += f'_s{self.args.seed}'
         if os.path.exists(f'{output_dir}/{self.args.result_fname}.json'):
             existed = json_load(f'{output_dir}/{self.args.result_fname}.json')
             texts, predictions, tracks = existed['prompts'], existed['outputs'], existed['tracks']
+            self.flops, self.durations = existed['flops'], existed['duration']
         for batch in eval_dataloader:
             if batch['input_ids'].size(-1) >= self.args.max_length: continue
             cnt += 1
@@ -252,7 +254,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         if self.args.do_decoding:
             json_dump({'prompts': texts, 'outputs': predictions, 'tracks': tracks, 'flops': self.flops, 'duration': self.durations}, 
                       f'{output_dir}/{self.args.result_fname}.json')
-            import ipdb; ipdb.set_trace()
+            # import ipdb; ipdb.set_trace()
         else:
             # Gather results from all processes
             min_key = torch.tensor(min(losses.keys()), device=self.args.device)
@@ -298,6 +300,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         replace_indexes: torch.LongTensor | None = None,
         return_logits: bool = False,
         use_cache: bool = False,
+        freeze_backbone: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Loss function for supervised finetuning."""
         outputs: OAModelOutput = self.model(
@@ -310,6 +313,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             topk_ids=topk_ids,
             replace_indexes=replace_indexes,
             use_cache=use_cache,
+            freeze_backbone=freeze_backbone,
         )
         if return_logits:
             return {
@@ -423,7 +427,8 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         
         replace_threshold = torch.stack(replace_threshold_list, dim=0).mean()
         replace_ratio = torch.stack(replace_ratio_list, dim=0).mean()
-        
+        # import ipdb; ipdb.set_trace()
+        # print(self.tokenizer.decode(cur_input_ids, skip_special_tokens=True), self.tokenizer.decode(input_ids[i].clone(), skip_special_tokens=True))    
         return {
             'input_ids': new_input_ids,     # (B, L)
             'labels': labels_to_predict,        # (B, L, Wf + Wb + 1)
@@ -435,6 +440,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             'replace_indexes': None,
             'replace_threshold': replace_threshold,
             'replace_ratio': replace_ratio,
+            'freeze_backbone': False,   # True,
         }
     
     @torch.no_grad()
@@ -549,7 +555,6 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 #         orig_input_ids[replace_indexes[bid][j]] = topk_ids[bid][j][idx]
                 #     padded_labels[bid] = orig_input_ids[position_ids_to_predict[bid]]
         
-        # import ipdb; ipdb.set_trace()
         return {
             'input_ids': new_input_ids,     # (B, L)
             'labels': padded_labels,        # (B, L, Wf + Wb + 1)
@@ -561,6 +566,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             'replace_indexes': replace_indexes if _probs is not None else None,
             'replace_threshold': replace_threshold,
             'replace_ratio': replace_ratio,
+            'freeze_backbone': is_training and force_replace,
         }
     
     def create_oa_batch(self, batch: SupervisedDataset, force_replace: bool = False, fixed_replace_threshold: float = -1) -> dict[str, Any]:
@@ -578,6 +584,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         replace_indexes: torch.LongTensor | None = None,
         replace_threshold: torch.Tensor | None = None,
         replace_ratio: torch.Tensor | None = None,
+        freeze_backbone: bool = False,
     ) -> dict[str, Any]:
         """Performs a single training step.
 
@@ -600,6 +607,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             replace_indexes=replace_indexes,
             use_cache=False,
             return_logits=True,
+            freeze_backbone=freeze_backbone,
         )
         
         loss = outputs['loss']
@@ -607,7 +615,7 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         coef = 1.0 if replace_ratio > 0 else self.args.no_noise_coef
         self.model.backward(coef * loss)
         self.model.step()
-        # import ipdb; ipdb.set_trace()
+        
         ############################## sanity check ##############################
         logits = outputs['logits'].detach()
         

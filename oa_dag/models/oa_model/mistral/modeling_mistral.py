@@ -369,6 +369,7 @@ class MistralModelOA(MistralPreTrainedModel):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
+        freeze_backbone: bool = False,
     ) -> tuple | BaseModelOutputWithPastOA:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -488,6 +489,8 @@ class MistralModelOA(MistralPreTrainedModel):
         # last layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
+        if freeze_backbone:
+            hidden_states = hidden_states.detach()
         if self.training:
             hidden_states.requires_grad_()
         if self.gradient_checkpointing and self.training:
@@ -588,6 +591,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
+        freeze_backbone: bool = False,
     ) -> tuple | OAModelOutput:
         r"""
         Args:
@@ -665,6 +669,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            freeze_backbone=freeze_backbone,
         )
         
         hidden_states = outputs[0]
@@ -781,6 +786,8 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
         # processors.append(EtaLogitsWarper(epsilon=1-topp))
         greedy_processors = LogitsProcessorList()
         greedy_processors.append(TopKLogitsWarper(top_k=1, min_tokens_to_keep=1))
+        
+        backward_size = max(-1, backward_size)
         
         batch_size, seq_length = input_ids.size(0), input_ids.size(-1)
         start_idx, end_idx = seq_length, max_length - 1
@@ -939,9 +946,10 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
                 iter_cnt_mid = 0
             prev_max_start_idx = max(prev_max_start_idx, start_idx)
             
-            if (new_input_ids[0].eq(tokenizer.eos_token_id).any() and (accept_idx >= eos_idx)) or start_idx >= max_length or iter_cnt_last > backward_size or len(tracks) > max_iter_times:
+            if (new_input_ids[0].eq(tokenizer.eos_token_id).any() and (accept_idx >= eos_idx)) or start_idx >= max_length or iter_cnt_last > max(occurance_threshold, backward_size) or len(tracks) > max_iter_times:
                 keep_generate = False
                 input_ids = new_input_ids
+                import ipdb; ipdb.set_trace()
                 break
             # import ipdb; ipdb.set_trace()
             # update position_ids, position_ids_to_predict
@@ -980,11 +988,13 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
         verbal: bool = False,
         use_cache: bool = False,
         epsilon: float = 0.1,
+        add_denoising: bool = False,
     ):
         batch_size, seq_length = input_ids.size(0), input_ids.size(-1)
         assert batch_size == 1, "Only support batch size 1 for now !!!"
         assert max_length > seq_length, "Input sequence length exceeds maximum length !!!"
         
+        raw_block_size = block_size
         block_size = 1 if left2right else block_size
         pred_window_size = 1 if left2right else (forward_size + backward_size + 1)
         if position_ids_to_predict is None:
@@ -1003,7 +1013,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
             attention_mask = input_ids.ne(tokenizer.pad_token_id)
         
         if left2right:            
-            return self.next_token_generate(
+            tracks, input_ids = self.next_token_generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -1014,7 +1024,7 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
                 verbal=verbal,
             )
         else:
-            return self.multiple_token_generate(
+            tracks, input_ids = self.multiple_token_generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -1033,3 +1043,5 @@ class MistralForCausalLMOA(OAModelMixin, MistralPreTrainedModel):
                 skip_verify=skip_verify,
                 epsilon=epsilon,
             )
+
+        return tracks, input_ids

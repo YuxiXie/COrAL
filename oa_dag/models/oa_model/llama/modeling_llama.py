@@ -407,6 +407,7 @@ class LlamaModelOA(LlamaPreTrainedModel):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
+        freeze_backbone: bool = False,
     ) -> tuple | BaseModelOutputWithPastOA:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -515,6 +516,8 @@ class LlamaModelOA(LlamaPreTrainedModel):
         # last layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
+        if freeze_backbone:
+            hidden_states = hidden_states.detach()
         if self.training:
             hidden_states.requires_grad_()
         if self.gradient_checkpointing and self.training:
@@ -615,6 +618,7 @@ class LlamaForCausalLMOA(OAModelMixin, LlamaPreTrainedModel):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
+        freeze_backbone: bool = False,
     ) -> tuple | OAModelOutput:
         r"""
         Args:
@@ -692,6 +696,7 @@ class LlamaForCausalLMOA(OAModelMixin, LlamaPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            freeze_backbone=freeze_backbone,
         )
         
         hidden_states = outputs[0]
@@ -791,21 +796,25 @@ class LlamaForCausalLMOA(OAModelMixin, LlamaPreTrainedModel):
         block_size: int = 16,
         forward_size: int = 4,
         backward_size: int = 8,
-        eval_forward_size: int = 1,
-        eval_backward_size: int = 2,
+        eval_forward_size: int = 4,
+        eval_backward_size: int = 8,
         occurance_threshold: int = 8,
         topk: int = 16,
-        topp: float = .95,
+        topp: float = .99,
         max_iter_times: int = 512,
-        last_iter_times: int = 4,
         verbal: bool = False,
+        skip_verify: bool = True,
+        epsilon: float = 0.1,
     ):
-        # import time
+        import time
         
         processors = LogitsProcessorList()
         # processors.append(TopPLogitsWarper(top_p=topp, min_tokens_to_keep=1))
-        # greedy_processors = LogitsProcessorList()
-        # greedy_processors.append(TopKLogitsWarper(top_k=1, min_tokens_to_keep=1))
+        # processors.append(EtaLogitsWarper(epsilon=1-topp))
+        greedy_processors = LogitsProcessorList()
+        greedy_processors.append(TopKLogitsWarper(top_k=1, min_tokens_to_keep=1))
+        
+        backward_size = max(-1, backward_size)
         
         batch_size, seq_length = input_ids.size(0), input_ids.size(-1)
         start_idx, end_idx = seq_length, max_length - 1
@@ -813,8 +822,8 @@ class LlamaForCausalLMOA(OAModelMixin, LlamaPreTrainedModel):
         pred_start_pos = fixed_seq_length = seq_length
         occurance_counts = torch.ones_like(input_ids)  # record the occurance times of predicted tokens
         iter_cnt_last, iter_cnt_mid, prev_max_start_idx = 0, 0, -1
+        accept_ratios = None
         while keep_generate:
-            # stime = time.time()
             outputs: OAModelOutput = self(
                 input_ids=input_ids,    # (1, L)
                 attention_mask=torch.ones_like(input_ids).bool(),    # (1, L)
@@ -824,15 +833,13 @@ class LlamaForCausalLMOA(OAModelMixin, LlamaPreTrainedModel):
             )
             logits = outputs.logits.contiguous().view(batch_size, input_ids.size(-1), position_ids_to_predict.size(-1), -1)     # (1, L * N, V) --> (1, L, N, V)
             logits = logits[:, seq_length - 1:, ...].contiguous()    # (1, L, N, V) --> (1, L', N, V)
-            # print('[F1]', time.time() - stime)
             
             pred_start_pos = fixed_seq_length
             pred_end_pos = position_ids_to_predict.max().item()
             ref_position_ids_to_predict = position_ids_to_predict[:, seq_length - 1:, :]    # (1, L', N)
             
-            # stime = time.time()
-            cur_input_ids, cur_position_ids, cur_attention_mask, cur_position_ids_to_predict, retrieve_indices, logprobs = \
-                prepare_candidates(
+            if skip_verify:
+                logprobs = prepare_candidates(
                     input_ids=input_ids,
                     logits=logits,
                     ref_position_ids_to_predict=ref_position_ids_to_predict,
@@ -845,34 +852,74 @@ class LlamaForCausalLMOA(OAModelMixin, LlamaPreTrainedModel):
                     processors=processors,
                     topk=topk,
                     max_length=max_length,
+                    accept_conf=accept_ratios,
+                    skip_verify=skip_verify,
                 )
-            # print('[P1]', time.time() - stime)
-            
-            # stime = time.time()
-            candidate_logits = self(
-                input_ids=cur_input_ids.unsqueeze(0),
-                attention_mask=cur_attention_mask.unsqueeze(0).unsqueeze(0),
-                position_ids=cur_position_ids.unsqueeze(0),
-                position_ids_to_predict=cur_position_ids_to_predict.unsqueeze(0),
-            ).logits.view(cur_input_ids.size(-1), -1, logits.size(-1))  # (Lt, W, V)
-            # print('[F2]', time.time() - stime)
-            
-            # stime = time.time()
-            losses, candidates = calculate_candidate_losses(
-                cur_input_ids=cur_input_ids,
-                cur_position_ids_to_predict=cur_position_ids_to_predict,
-                candidate_logits=candidate_logits,
-                retrieve_indices=retrieve_indices,
-                pred_start_pos=pred_start_pos,
-                pred_end_pos=pred_end_pos,
-                forward_size=eval_forward_size,
-                backward_size=eval_backward_size,
-            )
-            # print('[P2]', time.time() - stime)
-            
-            tokens = candidates[losses.min(dim=-1).indices].contiguous().view(batch_size, -1)   # (1, T)
+                token_scores = greedy_processors(input_ids, logprobs.exp())  # (1 * T, V)
+                probs = nn.functional.softmax(token_scores, dim=-1)  # (1 * T, V)
+                tokens = torch.multinomial(probs, num_samples=1).squeeze(-1).view(batch_size, -1)
+            else:
+                stime = time.time()
+                cur_input_ids, cur_position_ids, cur_attention_mask, cur_position_ids_to_predict, retrieve_indices, logprobs = \
+                    prepare_candidates(
+                        input_ids=input_ids,
+                        logits=logits,
+                        ref_position_ids_to_predict=ref_position_ids_to_predict,
+                        pred_start_pos=pred_start_pos,
+                        pred_end_pos=pred_end_pos,
+                        forward_size=forward_size,
+                        backward_size=backward_size,
+                        eval_forward_size=eval_forward_size,
+                        eval_backward_size=eval_backward_size,
+                        processors=processors,
+                        topk=topk,
+                        max_length=max_length,
+                        accept_conf=accept_ratios,
+                        max_new_tokens=int(block_size * 4),
+                    )
+                if verbal:
+                    print('[P1]', time.time() - stime)
+                
+                candidate_logits = self(
+                    input_ids=cur_input_ids.unsqueeze(0),
+                    attention_mask=cur_attention_mask.unsqueeze(0).unsqueeze(0),
+                    position_ids=cur_position_ids.unsqueeze(0),
+                    position_ids_to_predict=cur_position_ids_to_predict.unsqueeze(0),
+                ).logits.view(cur_input_ids.size(-1), -1, logits.size(-1))  # (Lt, W, V)
+                
+                stime = time.time()
+                token_losses, token_losses_forward, token_nt_losses, accept_flags, candidates = calculate_candidate_losses(
+                    cur_input_ids=cur_input_ids,
+                    cur_position_ids_to_predict=cur_position_ids_to_predict,
+                    candidate_logits=candidate_logits,
+                    retrieve_indices=retrieve_indices,
+                    pred_start_pos=pred_start_pos,
+                    pred_end_pos=pred_end_pos,
+                    forward_size=eval_forward_size,
+                    backward_size=eval_backward_size,
+                    epsilon=epsilon,
+                )
+                losses, losses_forward, nt_losses = token_losses.mean(-1), token_losses_forward.mean(-1), token_nt_losses.mean(-1)
+                losses_gap = nt_losses - losses_forward
+                losses_gap = losses_gap.masked_fill(losses_gap.lt(0), 0)
+                losses = losses + losses_gap
+                
+                # first_token_accept_flags = accept_flags[:, 0].ge(min(accept_flags[:, 0].max().item(), .5))
+                # sorted_losses = losses.sort(dim=-1)
+                # tmp_select_idx = first_token_accept_flags[sorted_losses.indices].nonzero().squeeze(-1)[0]
+                # select_idx = sorted_losses.indices[tmp_select_idx]
+                select_idx = losses.min(dim=-1).indices            
+                if verbal:
+                    print('[P2]', time.time() - stime)
+                    
+                tokens = candidates[select_idx].contiguous().view(batch_size, -1)   # (1, T)
+                accept_ratios = accept_flags[select_idx]
+                
             new_input_ids = torch.cat((input_ids[:, :pred_start_pos], tokens), dim=-1)
-            candidates = candidates[losses.sort(dim=-1).indices]
+            # tokenizer.batch_decode(candidates[all_losses.sort(dim=-1).indices])
+            # tokenizer.batch_decode(candidates[losses_gap.sort(dim=-1).indices])
+            # tokenizer.batch_decode(candidates[nt_losses.sort(dim=-1).indices])
+            # tokenizer.batch_decode(candidates[losses.sort(dim=-1).indices])
             
             # EOS
             eos_idx = new_input_ids[0].eq(tokenizer.eos_token_id).nonzero().squeeze(-1)
@@ -887,6 +934,8 @@ class LlamaForCausalLMOA(OAModelMixin, LlamaPreTrainedModel):
             if verbal:
                 iter_cnt = len(tracks)
                 print(f'[{iter_cnt}]', tokenizer.decode(new_input_ids[0].clone()))
+                if not skip_verify:
+                    print(accept_ratios.tolist())
             
             # convergence check
             min_seq_length = min(new_input_ids.size(-1), input_ids.size(-1))
@@ -896,33 +945,40 @@ class LlamaForCausalLMOA(OAModelMixin, LlamaPreTrainedModel):
             tmp_occurance_counts[0, :diff_idx] = occurance_counts[0, :diff_idx] + 1
             occurance_counts = tmp_occurance_counts     # (B, L*) update the occurance times
             
-            few_times_indexes = occurance_counts[0, fixed_seq_length:].le(occurance_threshold).nonzero().squeeze(-1)
-            few_times_idx = few_times_indexes[0] + fixed_seq_length if few_times_indexes.size(-1) > 0 else occurance_counts.size(-1)
-            few_times_idx = (pred_start_pos + few_times_indexes.min()).item() if few_times_indexes.size(-1) > 0 else occurance_counts.size(-1)
+            if not skip_verify:
+                rand_var = torch.rand(accept_ratios.size(-1), device=accept_ratios.device)
+                reject_indexes = accept_ratios.lt(rand_var).nonzero().squeeze(-1)
+                accept_idx = reject_indexes[0] + fixed_seq_length if reject_indexes.size(-1) > 0 else occurance_counts.size(-1)
+                accept_idx = (pred_start_pos + reject_indexes.min()).item() if reject_indexes.size(-1) > 0 else occurance_counts.size(-1)
+            else:
+                few_times_indexes = occurance_counts[0, fixed_seq_length:].le(occurance_threshold).nonzero().squeeze(-1)
+                few_times_idx = few_times_indexes[0] + fixed_seq_length if few_times_indexes.size(-1) > 0 else occurance_counts.size(-1)
+                few_times_idx = (pred_start_pos + few_times_indexes.min()).item() if few_times_indexes.size(-1) > 0 else occurance_counts.size(-1)
+                accept_idx = few_times_idx
             
-            # occurance_gaps = occurance_counts[0][:-1] - occurance_counts[0][1:]
-            # large_gap_idx = occurance_gaps[fixed_seq_length:].ge(occurance_threshold).nonzero().squeeze(-1)
-            # if large_gap_idx.size(-1) > 0:
-            #     large_gap_idx = large_gap_idx[0] + fixed_seq_length + 1
-            #     # fixed_seq_length = max(large_gap_idx, fixed_seq_length)
-            fixed_seq_length = min(few_times_idx, max(fixed_seq_length, new_input_ids.size(-1) - block_size + forward_size))
+            # fixed_seq_length = min(few_times_idx, accept_idx, max(fixed_seq_length, new_input_ids.size(-1) - block_size + forward_size))
+            # fixed_seq_length = min(accept_idx, max(fixed_seq_length, new_input_ids.size(-1) - block_size + forward_size))
+            # fixed_seq_length = max(accept_idx, fixed_seq_length + 1)
+            if tokens.size(-1) >= min(backward_size, block_size):
+                fixed_seq_length = max(accept_idx, fixed_seq_length)
             start_idx, end_idx = fixed_seq_length, fixed_seq_length + block_size
             
             if start_idx <= prev_max_start_idx:
                 iter_cnt_mid += 1
             else:
                 iter_cnt_mid = 0
-            if iter_cnt_mid > last_iter_times:
+            if iter_cnt_mid > occurance_threshold:
                 fixed_seq_length = start_idx = min(prev_max_start_idx + 1, new_input_ids.size(-1))
                 end_idx = prev_max_start_idx + 1 + block_size
                 iter_cnt_mid = 0
             prev_max_start_idx = max(prev_max_start_idx, start_idx)
-            print(input_ids.size(-1), new_input_ids.size(-1), start_idx, end_idx, prev_max_start_idx)
-            if (new_input_ids[0].eq(tokenizer.eos_token_id).any() and few_times_idx >= eos_idx) or iter_cnt_last > last_iter_times or len(tracks) > max_iter_times:
+            
+            if (new_input_ids[0].eq(tokenizer.eos_token_id).any() and (accept_idx >= eos_idx)) or start_idx >= max_length or iter_cnt_last > max(occurance_threshold, backward_size) or len(tracks) > max_iter_times:
                 keep_generate = False
                 input_ids = new_input_ids
+                import ipdb; ipdb.set_trace()
                 break
-            
+            # import ipdb; ipdb.set_trace()
             # update position_ids, position_ids_to_predict
             input_ids = new_input_ids
             if position_ids is not None:
@@ -952,14 +1008,20 @@ class LlamaForCausalLMOA(OAModelMixin, LlamaPreTrainedModel):
         block_size: int = 16,
         forward_size: int = 8,
         backward_size: int = 8,
+        eval_forward_size: int = 4,
+        eval_backward_size: int = 8,
+        skip_verify: bool = False,
         left2right: bool = False,
         verbal: bool = False,
         use_cache: bool = False,
+        epsilon: float = 0.1,
+        add_denoising: bool = False,
     ):
         batch_size, seq_length = input_ids.size(0), input_ids.size(-1)
         assert batch_size == 1, "Only support batch size 1 for now !!!"
         assert max_length > seq_length, "Input sequence length exceeds maximum length !!!"
         
+        raw_block_size = block_size
         block_size = 1 if left2right else block_size
         pred_window_size = 1 if left2right else (forward_size + backward_size + 1)
         if position_ids_to_predict is None:
@@ -978,7 +1040,7 @@ class LlamaForCausalLMOA(OAModelMixin, LlamaPreTrainedModel):
             attention_mask = input_ids.ne(tokenizer.pad_token_id)
         
         if left2right:            
-            return self.next_token_generate(
+            tracks, input_ids = self.next_token_generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -989,7 +1051,7 @@ class LlamaForCausalLMOA(OAModelMixin, LlamaPreTrainedModel):
                 verbal=verbal,
             )
         else:
-            return self.multiple_token_generate(
+            tracks, input_ids = self.multiple_token_generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -997,10 +1059,16 @@ class LlamaForCausalLMOA(OAModelMixin, LlamaPreTrainedModel):
                 block_size=block_size,
                 forward_size=forward_size,
                 backward_size=backward_size,
+                eval_forward_size=eval_forward_size,
+                eval_backward_size=eval_backward_size,
                 occurance_threshold=occurance_threshold,
                 topk=topk,
                 tokenizer=tokenizer,
                 max_length=max_length,
                 max_iter_times=max_iter_times,
                 verbal=verbal,
+                skip_verify=skip_verify,
+                epsilon=epsilon,
             )
+
+        return tracks, input_ids
