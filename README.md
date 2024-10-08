@@ -6,8 +6,8 @@ This repository contains code and analysis for the paper: [COrAL: Order-Agnostic
 
 * Modeling and Inference implementation: [`coral/models/oa_model`](./coral/models/oa_model)
 
-![Decoding Framework](framework-decoding.jpg)
-![Model Framework](framework-modeling.jpg)
+![Decoding Framework](framework-decoding.png)
+![Model Framework](framework-modeling.png)
 
 ## Environment Setup
 
