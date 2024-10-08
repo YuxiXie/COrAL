@@ -49,7 +49,7 @@ bash scripts/coral-stage2-arithmetic.sh $gpus
 ```
 @article{xie2024coral,
   title={COrAL: Order-Agnostic Language Modeling for Efficient Iterative Refinement},
-  author={Xie, Yuxi and Goyal, Anirudh and Wu, Xiaobao and and Yin, Xunjian and Xu, Xiao and Kan, Min-Yen and Pan, Liangming and Wang, William Yang},
+  author={Xie, Yuxi and Goyal, Anirudh and Wu, Xiaobao and Yin, Xunjian and Xu, Xiao and Kan, Min-Yen and Pan, Liangming and Wang, William Yang},
   year={2024}
 }
 ```
