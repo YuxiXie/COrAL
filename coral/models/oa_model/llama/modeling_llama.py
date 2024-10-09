@@ -902,10 +902,6 @@ class LlamaForCausalLMOA(OAModelMixin, LlamaPreTrainedModel):
                 losses_gap = losses_gap.masked_fill(losses_gap.lt(0), 0)
                 losses = losses + losses_gap
                 
-                # first_token_accept_flags = accept_flags[:, 0].ge(min(accept_flags[:, 0].max().item(), .5))
-                # sorted_losses = losses.sort(dim=-1)
-                # tmp_select_idx = first_token_accept_flags[sorted_losses.indices].nonzero().squeeze(-1)[0]
-                # select_idx = sorted_losses.indices[tmp_select_idx]
                 select_idx = losses.min(dim=-1).indices            
                 if verbal:
                     print('[P2]', time.time() - stime)
@@ -914,10 +910,6 @@ class LlamaForCausalLMOA(OAModelMixin, LlamaPreTrainedModel):
                 accept_ratios = accept_flags[select_idx]
                 
             new_input_ids = torch.cat((input_ids[:, :pred_start_pos], tokens), dim=-1)
-            # tokenizer.batch_decode(candidates[all_losses.sort(dim=-1).indices])
-            # tokenizer.batch_decode(candidates[losses_gap.sort(dim=-1).indices])
-            # tokenizer.batch_decode(candidates[nt_losses.sort(dim=-1).indices])
-            # tokenizer.batch_decode(candidates[losses.sort(dim=-1).indices])
             
             # EOS
             eos_idx = new_input_ids[0].eq(tokenizer.eos_token_id).nonzero().squeeze(-1)
@@ -954,9 +946,6 @@ class LlamaForCausalLMOA(OAModelMixin, LlamaPreTrainedModel):
                 few_times_idx = (pred_start_pos + few_times_indexes.min()).item() if few_times_indexes.size(-1) > 0 else occurance_counts.size(-1)
                 accept_idx = few_times_idx
             
-            # fixed_seq_length = min(few_times_idx, accept_idx, max(fixed_seq_length, new_input_ids.size(-1) - block_size + forward_size))
-            # fixed_seq_length = min(accept_idx, max(fixed_seq_length, new_input_ids.size(-1) - block_size + forward_size))
-            # fixed_seq_length = max(accept_idx, fixed_seq_length + 1)
             if tokens.size(-1) >= min(backward_size, block_size):
                 fixed_seq_length = max(accept_idx, fixed_seq_length)
             start_idx, end_idx = fixed_seq_length, fixed_seq_length + block_size
@@ -974,9 +963,8 @@ class LlamaForCausalLMOA(OAModelMixin, LlamaPreTrainedModel):
             if (new_input_ids[0].eq(tokenizer.eos_token_id).any() and (accept_idx >= eos_idx)) or start_idx >= max_length or iter_cnt_last > max(occurance_threshold, backward_size) or len(tracks) > max_iter_times:
                 keep_generate = False
                 input_ids = new_input_ids
-                import ipdb; ipdb.set_trace()
                 break
-            # import ipdb; ipdb.set_trace()
+            
             # update position_ids, position_ids_to_predict
             input_ids = new_input_ids
             if position_ids is not None:
