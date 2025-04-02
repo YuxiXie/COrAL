@@ -62,7 +62,8 @@ class TrainerBase(metaclass=abc.ABCMeta):
         self.args.log_dir = self.args.log_dir or self.args.output_dir
         self.args.log_project = self.args.log_project or 'safe-rlhf'
         model_type = self.args.output_dir.strip('/').split('/')[-1]
-        self.args.log_run_name = self.args.log_run_name or f'{self.TRAINING_TYPE}-{model_type}-{time}'
+        # self.args.log_run_name = self.args.log_run_name or f'{self.TRAINING_TYPE}-{model_type}-{time}'
+        self.args.log_run_name = f'{self.args.log_run_name}-{model_type}-{time}'
 
         self.logger = Logger(
             log_type=self.args.log_type,

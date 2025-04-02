@@ -852,6 +852,7 @@ class LlamaForCausalLMOA(OAModelMixin, LlamaPreTrainedModel):
                     max_length=max_length,
                     accept_conf=accept_ratios,
                     skip_verify=skip_verify,
+                    verbal=verbal,
                 )
                 token_scores = greedy_processors(input_ids, logprobs.exp())  # (1 * T, V)
                 probs = nn.functional.softmax(token_scores, dim=-1)  # (1 * T, V)
@@ -874,6 +875,7 @@ class LlamaForCausalLMOA(OAModelMixin, LlamaPreTrainedModel):
                         max_length=max_length,
                         accept_conf=accept_ratios,
                         max_new_tokens=int(block_size * 16),
+                        verbal=verbal,
                     )
                 if verbal:
                     print('[P1]', time.time() - stime)
@@ -886,7 +888,7 @@ class LlamaForCausalLMOA(OAModelMixin, LlamaPreTrainedModel):
                 ).logits.view(cur_input_ids.size(-1), -1, logits.size(-1))  # (Lt, W, V)
                 
                 stime = time.time()
-                token_losses, token_losses_forward, token_nt_losses, accept_flags, candidates = calculate_candidate_losses(
+                token_losses, token_losses_forward, all_losses, token_nt_losses, accept_flags, candidates = calculate_candidate_losses(
                     cur_input_ids=cur_input_ids,
                     cur_position_ids_to_predict=cur_position_ids_to_predict,
                     candidate_logits=candidate_logits,

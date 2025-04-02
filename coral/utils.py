@@ -24,7 +24,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from optree.typing import PyTreeTypeVar
-from transformers import PreTrainedTokenizerBase
+from transformers import PreTrainedTokenizerBase, AutoModelForCausalLM
 from transformers.modeling_outputs import ModelOutput
 from transformers.generation.utils import LogitsProcessorList
 from transformers.tokenization_utils import BatchEncoding, PaddingStrategy, TruncationStrategy
@@ -59,8 +59,9 @@ def jsonlines_load(x):
         data = [r for r in reader]
     return data
 
-def jsonlines_dump(x, d):
-    with jsonlines.open(x, mode='w') as writer:
+def jsonlines_dump(x, d, mode='w'):
+    if not os.path.exists(x): mode='w'
+    with jsonlines.open(x, mode=mode) as writer:
         writer.write_all(d)
 
 
@@ -370,28 +371,49 @@ def add_noise(cur_input_ids: torch.LongTensor, cur_labels: torch.LongTensor, rat
 
 def corrupt_context(cur_input_ids: torch.LongTensor, cur_labels: torch.LongTensor, 
                     raw_input_ids: torch.LongTensor, raw_labels: torch.LongTensor, raw_label_positions: torch.LongTensor,
-                    context_size: int, num_contexts: int, context_inject_ratio_generator):
+                    context_size: int, num_contexts: int, context_inject_ratio_generator, 
+                    sample_from_future: bool = False, sample_from_near: bool = False,
+                    fixed_replace_threshold: float = -1, tokenizer = None):
     label_start_idx = raw_label_positions[0].item()
     keep_inject = True
+    sample_from_future = False if sample_from_near else sample_from_future
     while keep_inject:
         cur_inject_cnt, prev_inject = 0, False
-        context_inject_ratio = context_inject_ratio_generator.rvs(1)[0]
+        context_inject_ratio = fixed_replace_threshold if fixed_replace_threshold >= 0 else context_inject_ratio_generator.rvs(1)[0]
         for j in range(num_contexts):
             gt_context = raw_input_ids.clone()[raw_label_positions[j * context_size: (j + 1) * context_size]]
-            if random.random() < context_inject_ratio and not prev_inject:
-                fake_context_idx = random.randint(0, num_contexts - 1)
-                fake_context = raw_input_ids.clone()[raw_label_positions[fake_context_idx * context_size: (fake_context_idx + 1) * context_size]]
+            var1, var2 = torch.rand(dist.get_world_size())[dist.get_rank()], torch.rand(dist.get_world_size())[dist.get_rank()]
+            # if var1 < context_inject_ratio and not prev_inject:
+            if var1 < context_inject_ratio:
+                if sample_from_near:
+                    # fake_context_idx = random.randint(max(0, j - 2), min(num_contexts - 1, j + 2))
+                    fake_context_idx = random.randint(max(0, (j - 1) * context_size), min(raw_label_positions.size(-1) - context_size, (j + 1) * context_size))
+                elif sample_from_future:
+                    fake_context_idx = random.randint(j, num_contexts - 1)
+                else:
+                    fake_context_idx = random.randint(0, num_contexts - 1)
+                # fake_context = raw_input_ids.clone()[raw_label_positions[fake_context_idx * context_size: (fake_context_idx + 1) * context_size]]
+                fake_context = raw_input_ids.clone()[raw_label_positions[fake_context_idx: fake_context_idx + context_size]]
                 min_len = min(gt_context.size(-1), fake_context.size(-1))
                 tmp_context = gt_context.clone()
                 tmp_context[:min_len] = fake_context[:min_len]
                 fake_context = tmp_context
+                
+                var11 = torch.rand(dist.get_world_size())[dist.get_rank()]
+                replace_fake = torch.rand(fake_context.size(-1), device=fake_context.device)
+                fake_context = fake_context * replace_fake.gt(var11 / 2) + gt_context * replace_fake.le(var11 / 2)
+                
                 cur_input_ids = torch.cat((cur_input_ids, fake_context), dim=-1)
                 cur_labels = torch.cat((cur_labels, gt_context), dim=-1)
                 cur_inject_cnt += 1
                 prev_inject = True
-            elif random.random() < context_inject_ratio and not prev_inject:
-                if random.random() < .5:
-                    cur_input_ids = torch.cat((cur_input_ids, gt_context[0].unsqueeze(-1).expand(gt_context.size(-1))), dim=-1)
+            elif var2 < context_inject_ratio and not prev_inject:
+                var3 = torch.rand(dist.get_world_size())[dist.get_rank()]
+                if var3 < .5:
+                    max_len = gt_context.size(-1)
+                    repeat_num = random.randint(1, (max_len + 1) // 2)
+                    cur_input_ids = torch.cat((cur_input_ids, gt_context[0].unsqueeze(-1).expand(repeat_num)), dim=-1)
+                    cur_input_ids = torch.cat((cur_input_ids, gt_context[1: 1 + max_len - repeat_num]), dim=-1)
                     prev_inject = True
                 else:
                     cur_input_ids = torch.cat((cur_input_ids, gt_context), dim=-1)
@@ -605,8 +627,7 @@ def update_variance(logprobs: torch.FloatTensor, available_indexes: torch.LongTe
 
 
 def extract_logprobs_into_dict(
-    input_ids: torch.LongTensor,
-    logits: torch.FloatTensor, 
+    logprobs: torch.FloatTensor, 
     ref_position_ids_to_predict: torch.LongTensor,
     pred_start_pos: int, 
     pred_end_pos: int,
@@ -614,38 +635,53 @@ def extract_logprobs_into_dict(
     backward_size: int = 8,
     accept_conf: torch.FloatTensor = None,
 ):
-    batch_size = input_ids.size(0)
-    logprobs = logits.view(-1, logits.size(-1)).log_softmax(dim=-1).view(logits.size(1), -1, logits.size(-1)).unsqueeze(0)    # (1 * S, V) --> (1, L', N, V)
-    window_size = forward_size + backward_size + 1
+    batch_size, seq_length, ndim = logprobs.size(0), logprobs.size(1), logprobs.size(-1)
+    window_size = forward_size + backward_size + 1  # N
     target_seq_len = pred_end_pos - pred_start_pos + 1
     
+    # accpetance confidence
     if accept_conf is None:
-        accept_conf = torch.ones((logprobs.size(1),), device=logprobs.device)
-    elif accept_conf.size(-1) < logprobs.size(1):
-        accept_conf = torch.cat((torch.ones((logprobs.size(1) - accept_conf.size(-1),), device=logprobs.device), accept_conf), dim=-1)
+        accept_conf = torch.ones((seq_length,), dtype=logprobs.dtype, device=logprobs.device)
+    elif accept_conf.size(-1) < seq_length:
+        accept_conf = torch.cat((torch.ones((seq_length - accept_conf.size(-1),), dtype=accept_conf.dtype, device=logprobs.device), accept_conf), dim=-1)
+    elif accept_conf.size(-1) > seq_length:
+        accept_conf = accept_conf[-seq_length:]
     accept_conf = accept_conf.cummin(-1).values + 1
     
-    padded_logprobs = torch.zeros(batch_size, logprobs.size(1) + window_size - 1, window_size, logprobs.size(-1), dtype=logprobs.dtype, device=logprobs.device) # (1, N, T, V)
-    shifted_indices = torch.arange(logprobs.size(1)).unsqueeze(1) + torch.arange(window_size).unsqueeze(0)
-    padded_logprobs[0, shifted_indices, torch.arange(window_size).unsqueeze(0)] = logprobs   # (1, N, L', V)
-    idx1 = ref_position_ids_to_predict[0].sum(-1).nonzero()[0][0]
-    idx2 = ref_position_ids_to_predict[0, idx1].nonzero()[0][0]
-    padded_logprobs = padded_logprobs.contiguous()[:, idx2: idx2 + target_seq_len]
+    # pad logprobs to shift and fit the target indices
+    padded_logprobs = torch.zeros(
+        (batch_size, seq_length + window_size - 1, window_size, ndim,), 
+        dtype=logprobs.dtype, 
+        device=logprobs.device,
+    ) # (1, L, N, V)
+    shifted_indices = torch.arange(seq_length).unsqueeze(1) + torch.arange(window_size).unsqueeze(0)    # (L', N)
+    padded_logprobs[0, shifted_indices, torch.arange(window_size)] = logprobs[0]   # (L', N, V)
+    idx1 = ref_position_ids_to_predict[0].sum(-1).nonzero()[0][0]   # available start index for the seq_len dimension
+    idx2 = ref_position_ids_to_predict[0, idx1].nonzero()[0][0]     # available start index for the target_pos dimension
+    padded_logprobs = padded_logprobs.contiguous()[:, idx2: idx2 + target_seq_len]  # (1, T, N, V)
     
-    # extract scores from logits
+    # create pad weights
     lambda_list = get_exp_dist(forward_size=forward_size, backward_size=backward_size, device=logprobs.device)
-    padded_weights = torch.zeros(batch_size, logprobs.size(1) + window_size - 1, window_size, dtype=lambda_list.dtype, device=lambda_list.device)
-    padded_weights[0, shifted_indices, torch.arange(window_size).unsqueeze(0)] = accept_conf.unsqueeze(1).expand(accept_conf.size(-1), window_size)
+    padded_weights = torch.zeros(batch_size, seq_length + window_size - 1, window_size, dtype=lambda_list.dtype, device=lambda_list.device)
+    padded_weights[0, shifted_indices, torch.arange(window_size)] = accept_conf.unsqueeze(1).expand(accept_conf.size(-1), window_size)
     padded_weights = padded_weights.contiguous()[:, idx2: idx2 + target_seq_len]
-    padded_weights = padded_weights * lambda_list.unsqueeze(0).unsqueeze(0)
+    padded_weights = padded_weights * lambda_list
     
-    ensemble_logits = padded_logprobs.sum(-2) / padded_weights.sum(-1).unsqueeze(-1)
-    return padded_logprobs, ensemble_logits
+    ensemble_logprobs = (padded_logprobs * padded_weights.unsqueeze(-1)).sum(-2) / padded_weights.sum(-1).unsqueeze(-1)    # (1, T, V)
+    return padded_logprobs, ensemble_logprobs
 
+# from transformers import AutoTokenizer
+# tokenizer = AutoTokenizer.from_pretrained('/share/edc/home/yuxi_xie/oa_dag/model-checkpoints/sft/metamath-mistral/checkpoint-18516')
 
-def create_tree_attention_mask(logprobs: torch.FloatTensor, forward_size: int = 1, topk: int = 16, maximum_seq_len: int = 100, scale_factor: float = 16):
-    n_depth = logprobs.size(0)
-    results = torch.topk(logprobs.view(-1, logprobs.size(-1)), k=topk, dim=-1)
+def create_tree_attention_mask(
+    logprobs: torch.FloatTensor, 
+    forward_size: int = 1, 
+    topk: int = 16, 
+    maximum_seq_len: int = 100, 
+    scale_factor: float = 16,
+):
+    n_depth, ndim = logprobs.size(0), logprobs.size(-1)
+    results = torch.topk(logprobs, k=topk, dim=-1)
     topk = results.values.size(-1)
     
     # # sort tokens by accuracies
@@ -658,12 +694,12 @@ def create_tree_attention_mask(logprobs: torch.FloatTensor, forward_size: int = 
     # sorted_conf = accuracies.view(-1).sort(descending=True)
     
     # sort tokens by confidence scores
-    confidence = results.values.clone()
-    for i in range(forward_size):
-        # scale last few tokens
-        confidence[-i - 1] = confidence[-i - 1] / (forward_size - i + scale_factor - 1) * scale_factor
-    confidence = confidence.exp()
-    sorted_conf = confidence.view(-1).sort(descending=True)
+    # confidence = results.values.clone()
+    # for i in range(forward_size):
+    #     # scale last few tokens
+    #     confidence[-i - 1] = confidence[-i - 1] / (forward_size - i + scale_factor - 1) * scale_factor
+    # confidence = confidence.exp()
+    sorted_conf = results.values.exp().view(-1).sort(descending=True)
     
     positions = torch.arange(0, n_depth, dtype=torch.long, device=logprobs.device).unsqueeze(-1).expand(n_depth, topk)
     topk_indexes = torch.arange(0, topk, dtype=torch.long, device=logprobs.device).unsqueeze(0).expand(n_depth, topk)
@@ -812,42 +848,54 @@ def prepare_candidates(
     backward_size: int = 8,
     eval_forward_size: int = 1,
     eval_backward_size: int = 8,
-    processors: LogitsProcessorList = LogitsProcessorList(),
+    # processors: LogitsProcessorList = LogitsProcessorList(),
     topk: int = 16,
     max_new_tokens = 128,
     max_length: int = 512,
     accept_conf: torch.FloatTensor = None, 
     skip_verify: bool = False,
+    verbal: bool = False,
 ):
+    stime = time.time()
+    seq_length, ndim = logits.size(1), logits.size(-1)
+    logprobs = logits.view(-1, ndim).log_softmax(dim=-1).view(
+        seq_length, -1, ndim
+    ).unsqueeze(0)    # (1, L', N, V) --> (L' * N, V) --> (1, L', N, V)
+    
     # aggregate all predicted distributions
-    _, ensemble_logits = extract_logprobs_into_dict(
-        input_ids=input_ids,
-        logits=logits,
+    _, ensemble_logprobs = extract_logprobs_into_dict(
+        logprobs=logprobs,
         ref_position_ids_to_predict=ref_position_ids_to_predict,
         pred_start_pos=pred_start_pos,
         pred_end_pos=pred_end_pos,
         forward_size=forward_size,
         backward_size=backward_size,
         accept_conf=accept_conf,
-    )
+    )   # (1, T, V)
     
     # sample and get candidate tokens
-    token_scores = processors(input_ids, ensemble_logits.view(-1, ensemble_logits.size(-1)))  # (1 * T, V)
-    logprobs = nn.functional.log_softmax(token_scores, dim=-1)  # (1 * T, V)
+    # token_scores = processors(input_ids, ensemble_logprobs.view(-1, ndim))  # (1 * T, V)
+    # logprobs = nn.functional.log_softmax(token_scores, dim=-1)  # (1 * T, V)
+    if verbal:
+        print('[P1-1]', time.time() - stime)
     
     if skip_verify:
-        return logprobs
+        return ensemble_logprobs
     
+    stime = time.time()
     # tree attention construction
     candidate_ids, candidate_position_ids, tree_attn_mask, retrieve_indices = \
         create_tree_attention_mask(
-            logprobs, 
+            nn.functional.log_softmax(ensemble_logprobs.view(-1, ndim), dim=-1),
             topk=topk, 
             forward_size=min(forward_size, max(0, pred_end_pos + 1 - input_ids.size(-1))),
             maximum_seq_len=max_new_tokens,
         )
     retrieve_indices = retrieve_indices + input_ids[0, :pred_start_pos].size(-1) - 1
+    if verbal:
+        print('[P1-2]', time.time() - stime)
     
+    stime = time.time()
     # tree attention input prepare
     cur_input_ids, cur_position_ids, cur_attention_mask, cur_position_ids_to_predict = \
         prepare_candidate_input_output(
@@ -860,40 +908,42 @@ def prepare_candidates(
             forward_size=eval_forward_size,
             backward_size=eval_backward_size,
         )
+    if verbal:
+        print('[P1-3]', time.time() - stime)
     
-    return cur_input_ids, cur_position_ids, cur_attention_mask, cur_position_ids_to_predict, retrieve_indices, logprobs
+    return cur_input_ids, cur_position_ids, cur_attention_mask, cur_position_ids_to_predict, retrieve_indices, ensemble_logprobs
 
 
-def extract_accept_flags(scores: torch.FloatTensor, losses: torch.FloatTensor, epsilon: float=0.2, top_p: float=0.6):
+def extract_accept_flags(logits: torch.FloatTensor, losses: torch.FloatTensor, epsilon: float=0.2, top_p: float=0.6):
+    scores = logits.contiguous().view(-1, logits.size(-1))
+    
     try:
-        try:
-            epsilon = torch.tensor(epsilon)
-            
-            # Calculate the adaptive cutoff
-            probabilities = scores.softmax(dim=-1)
-            # entropy = torch.distributions.Categorical(logits=scores).entropy()
-            entropy = -torch.sum(
-                probabilities * torch.log(probabilities + 1e-5), dim=-1
-            )
-            eta = torch.min(epsilon, torch.sqrt(epsilon) * torch.exp(-entropy))[..., None]
-            indices_to_remove = probabilities < eta
-            
-            probabilities = probabilities.masked_fill(indices_to_remove, 2)
-            maxlosses = -probabilities.min(dim=-1).values.log()
-        except:
-            torch.cuda.empty_cache()
-            
-            sorted_logits = torch.sort(scores, descending=False).values
-            probabilities = sorted_logits.softmax(dim=-1)
-            cumulative_probs = probabilities.cumsum(dim=-1)
-            
-            # Remove tokens with cumulative top_p above the threshold (token with 0 are kept)
-            sorted_indices_to_remove = cumulative_probs <= (1 - top_p)
-            probabilities = probabilities.masked_fill(sorted_indices_to_remove, 2)
-            maxlosses = -probabilities.min(dim=-1).values.log()
-    except:
-        import ipdb; ipdb.set_trace()
-
+        epsilon = torch.tensor(epsilon)
+        
+        # Calculate the adaptive cutoff
+        probabilities = scores.softmax(dim=-1)
+        # entropy = torch.distributions.Categorical(logits=scores).entropy()
+        entropy = -torch.sum(
+            probabilities * torch.log(probabilities + torch.finfo(scores.dtype).smallest_normal), dim=-1
+        )
+        eta = torch.min(epsilon, torch.sqrt(epsilon) * torch.exp(-entropy))[..., None]
+        indices_to_remove = probabilities < eta
+        
+        probabilities = probabilities.masked_fill(indices_to_remove, 2)
+        maxlosses = -probabilities.min(dim=-1).values.log()
+    except Exception as e:
+        print(str(e))
+        # torch.cuda.empty_cache()
+        
+        sorted_logits = torch.sort(scores, descending=False).values
+        probabilities = sorted_logits.softmax(dim=-1)
+        cumulative_probs = probabilities.cumsum(dim=-1)
+        
+        # Remove tokens with cumulative top_p above the threshold (token with 0 are kept)
+        sorted_indices_to_remove = cumulative_probs <= (1 - top_p)
+        probabilities = probabilities.masked_fill(sorted_indices_to_remove, 2)
+        maxlosses = -probabilities.min(dim=-1).values.log()
+    
     return losses.le(maxlosses.view(losses.size(0), losses.size(1), -1))
 
 
@@ -908,42 +958,155 @@ def calculate_candidate_losses(
     backward_size: int = 8,
     epsilon: float = 0.1,
 ):
+    batch_size, target_seq_len = retrieve_indices.size(0), retrieve_indices.size(-1) - 1
+    window_size = forward_size + backward_size + 1  
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     
-    shift_logits = candidate_logits[retrieve_indices].view(-1, candidate_logits.size(-1))
-    cur_labels = cur_input_ids.clone()
+    # extract losses for all candidates
+    shift_logits = candidate_logits[retrieve_indices].view(-1, candidate_logits.size(-1))   # [B * L' * W, V]
+    cur_labels = cur_input_ids.clone()  # flat ids
     cur_labels[:pred_start_pos] = IGNORE_INDEX
     positions_i = cur_position_ids_to_predict[retrieve_indices[0]] - pred_start_pos + 1
     positions_i = positions_i.masked_fill(positions_i.lt(1), 0)
-    shift_labels = cur_labels[retrieve_indices][:, positions_i].view(-1)
-    shift_losses = loss_fct(shift_logits, shift_labels).view(retrieve_indices.size(0), retrieve_indices.size(-1), -1)
+    positions_i = positions_i.masked_fill(positions_i.ge(cur_labels[retrieve_indices].size(1)), 0)
+    
+    shift_labels = cur_labels[retrieve_indices][:, positions_i].view(-1)    # (B, L', W) --> (B * L' * W)
+    shift_labels = shift_labels.masked_fill(positions_i.eq(0).unsqueeze(0).expand(batch_size, -1, -1).contiguous().view(-1), IGNORE_INDEX)
+    shift_losses = loss_fct(shift_logits, shift_labels).view(batch_size, target_seq_len + 1, -1)   # (B, L', W)
     candidates = cur_input_ids[retrieve_indices][:, 1:]
     
-    accept_flags = extract_accept_flags(shift_logits, shift_losses, epsilon=epsilon)
+    # calculate accept ratios
+    shift_logits = shift_logits.contiguous().view(batch_size, -1, shift_logits.size(-1))
+    try:
+        accept_flags = extract_accept_flags(shift_logits, shift_losses, epsilon=epsilon)   # (B, L', W)
+    except:
+        # torch.cuda.empty_cache()
+        n_batch = (batch_size + 31) // 32
+        accept_flags = []
+        for bidx in range(n_batch):
+            accept_flags.append(extract_accept_flags(
+                shift_logits[bidx * 32: (bidx + 1) * 32],
+                shift_losses[bidx * 32: (bidx + 1) * 32],
+                epsilon=epsilon,
+            ))
+        accept_flags = torch.cat(accept_flags, dim=0)
     
-    batch_size, target_seq_len = retrieve_indices.size(0), retrieve_indices.size(-1) - 1
-    window_size = forward_size + backward_size + 1    
-    padded_losses = torch.zeros(batch_size, shift_losses.size(1) + window_size - 1, window_size, dtype=shift_losses.dtype, device=shift_losses.device) # (1, N, T, V)
-    padded_flags = torch.zeros(batch_size, accept_flags.size(1) + window_size - 1, window_size, dtype=accept_flags.dtype, device=accept_flags.device) # (1, N, T, V)
-    
-    shifted_indices = torch.arange(shift_losses.size(1)).unsqueeze(1) + torch.arange(window_size).unsqueeze(0)
-    padded_losses[:, shifted_indices, torch.arange(window_size).unsqueeze(0)] = shift_losses
-    padded_flags[:, shifted_indices, torch.arange(window_size).unsqueeze(0)] = accept_flags
-    
+    # extract losses and accept flags
+    padded_losses = torch.zeros(
+        batch_size, target_seq_len + window_size, window_size, dtype=shift_losses.dtype, device=shift_losses.device,
+    ) # (1, N, T, V)
+    padded_flags = torch.zeros(
+        batch_size, target_seq_len + window_size, window_size, dtype=accept_flags.dtype, device=accept_flags.device,
+    ) # (1, N, T, V)
+    shifted_indices = torch.arange(target_seq_len + 1).unsqueeze(1) + torch.arange(window_size).unsqueeze(0)    # (L', W)
+    padded_losses[:, shifted_indices, torch.arange(window_size)] = shift_losses
+        
+    padded_flags[:, shifted_indices, torch.arange(window_size)] = accept_flags
     idx1 = cur_position_ids_to_predict.sum(-1).nonzero()[0][0]
     idx2 = cur_position_ids_to_predict[idx1].nonzero()[0][0]
-    padded_losses = padded_losses[:, idx2: idx2 + target_seq_len, :]
-    padded_flags = padded_flags[:, idx2: idx2 + target_seq_len, :]
+    padded_losses = padded_losses[:, idx2: idx2 + target_seq_len, :]    # (B, L, W)
+    padded_flags = padded_flags[:, idx2: idx2 + target_seq_len, :]      # (B, L, W)
     
-    lambda_list = get_exp_dist(forward_size=forward_size, backward_size=backward_size, forward_scale=1, backward_scale=1, reverse_forward=True, device=shift_losses.device)
-    weights = lambda_list.unsqueeze(0).unsqueeze(0).expand(batch_size, target_seq_len, window_size)
+    weights = get_exp_dist(
+        forward_size=forward_size, backward_size=backward_size, 
+        forward_scale=1, backward_scale=1, 
+        reverse_forward=True, device=shift_losses.device,
+    )
+    weighted_losses, weighted_flags = padded_losses * weights, padded_flags * weights
     
-    losses_1 = padded_losses[..., :backward_size + 2].sum(-1) / weights[..., :backward_size + 2].sum(-1)
+    # losses_1: losses reliable window range
+    losses_1 = weighted_losses[..., :backward_size + 2].sum(-1) / weights[..., :backward_size + 2].sum(-1)
+    # losses_2: losses in forward prediction range
     weights_2 = weights[..., backward_size + 2:].sum(-1)
     weights_2 = weights_2.masked_fill(weights_2.eq(0), 1)
-    losses_2 = padded_losses[..., backward_size + 2:].sum(-1) / weights_2
-    losses = padded_losses.sum(-1) / weights.sum(-1)
-    accept_flags = padded_flags[..., :backward_size + 2].sum(-1) / weights[..., :backward_size + 2].gt(0).sum(-1)
+    losses_2 = weighted_losses[..., backward_size + 2:].sum(-1) / weights_2
+    # accept_flags: only for reliable range
+    accept_flags = weighted_flags[..., :backward_size + 2].sum(-1) / weights[..., :backward_size + 2].gt(0).sum(-1)
     
-    return losses_1, losses_2, padded_losses[..., backward_size + 1] / weights[..., backward_size + 1], accept_flags, candidates
+    all_weights = get_exp_dist(
+        forward_size=forward_size, backward_size=backward_size, 
+        forward_scale=1, backward_scale=1, 
+        device=shift_losses.device
+    )
+    losses = (padded_losses * all_weights).sum(-1) / all_weights.sum(-1)
     
+    return losses_1, losses_2, losses, weighted_losses[..., backward_size + 1] / weights[..., backward_size + 1], accept_flags, candidates
+    
+
+def extract_distributions(model: AutoModelForCausalLM, hidden_states: list[torch.FloatTensor]):
+    proj_func = lambda hs: model.lm_head(model.model.norm(hs))
+    distributions = [proj_func(hs) for hs in hidden_states]
+    return distributions
+
+
+def cal_kl_divergence(last_layer_hidden_states: torch.FloatTensor, prev_layers_hidden_states: list[torch.FloatTensor]):
+    batch_size, vocab_size = last_layer_hidden_states.size(0), last_layer_hidden_states.size(-1)
+    seq_len = prev_layers_hidden_states[0].size(1)
+    
+    def _kl(log_q, p):
+        return F.kl_div(log_q.view(-1, vocab_size), 
+                        p.view(-1, vocab_size), 
+                        reduction='none').mean(-1).view(seq_len, -1).contiguous()
+    
+    last_layer_hidden_states = last_layer_hidden_states.view(batch_size, seq_len, -1, vocab_size)
+    window_size = last_layer_hidden_states.size(-2)
+    
+    # log_last_layer_hidden_states = last_layer_hidden_states.log_softmax(-1)
+    # kl_divergences = torch.stack([
+    #     torch.stack([
+    #         _kl(
+    #             log_last_layer_hidden_states[bid].contiguous(), 
+    #             hs[bid].softmax(-1).unsqueeze(-2).expand(seq_len, window_size, vocab_size).contiguous(),
+    #         ) for hs in prev_layers_hidden_states
+    #     ], dim=0) for bid in range(batch_size)
+    # ], dim=0)
+    last_layer_hidden_states = last_layer_hidden_states.softmax(-1)
+    kl_divergences = torch.stack([
+        torch.stack([
+            _kl(
+                hs[bid].log_softmax(-1).unsqueeze(-2).expand(seq_len, window_size, vocab_size).contiguous(),
+                last_layer_hidden_states[bid].contiguous(), 
+            ) for hs in prev_layers_hidden_states
+        ], dim=0) for bid in range(batch_size)
+    ], dim=0)
+    
+    return kl_divergences.transpose(0, 1).contiguous()  # (L, B, S, W)
+
+
+def cal_kl_divergence_pos(last_layer_hidden_states: torch.FloatTensor, prev_layers_hidden_states: list[torch.FloatTensor], position_ids_to_predict: torch.LongTensor):
+    batch_size, vocab_size = last_layer_hidden_states.size(0), last_layer_hidden_states.size(-1)
+    seq_len = prev_layers_hidden_states[0].size(1)
+    last_layer_hidden_states = last_layer_hidden_states.view(batch_size, seq_len, -1, vocab_size)
+    window_size = last_layer_hidden_states.size(-2)
+    
+    def _kl(log_q, p):
+        return F.kl_div(log_q.view(-1, vocab_size), 
+                        p.view(-1, vocab_size), 
+                        reduction='none').mean(-1).view(-1).contiguous()
+    
+    last_layer_hidden_states = last_layer_hidden_states.softmax(-1)
+    kl_divergences = []
+    for hs in prev_layers_hidden_states:
+        for bid in range(batch_size):
+            for sid in range(seq_len):
+                pos = position_ids_to_predict[bid][sid]
+                kl_divergences.append(_kl(
+                    hs[bid][pos].log_softmax(-1),
+                    last_layer_hidden_states[bid][sid]
+                ))
+    kl_divergences = torch.stack(kl_divergences, dim=0).view(len(prev_layers_hidden_states), batch_size, seq_len, -1)
+    return kl_divergences
+    
+
+def cal_pred_probability(labels: torch.LongTensor, prev_layers_hidden_states: list[torch.FloatTensor]):
+    batch_size, seq_len = labels.size(0), labels.size(1)
+    probs = []
+    for hs in prev_layers_hidden_states:
+        hs = hs.softmax(-1)
+        for bid in range(batch_size):
+            for sid in range(seq_len):
+                prb = hs[bid][sid][labels[bid][sid]]
+                prb = prb.masked_fill(labels[bid][sid].eq(IGNORE_INDEX), -1)
+                probs.append(prb)
+    probs = torch.stack(probs, dim=0).view(len(prev_layers_hidden_states), batch_size, seq_len, -1).contiguous()
+    return probs

@@ -251,6 +251,7 @@ class TokenizedDataset(Dataset[Dict[str, torch.Tensor]]):
         self.tokenizer = tokenizer
         self.model_type = model_type
         self.seed = seed
+        self.lazy_tokenization = lazy_tokenization
 
         merged_rawdata = self._merge_raw_datasets(seed=seed)
         self.rawdata = [merged_rawdata[i] for i in range(len(merged_rawdata))]
@@ -341,7 +342,7 @@ class TokenizedDataset(Dataset[Dict[str, torch.Tensor]]):
             add_special_tokens=add_special_tokens,
             padding=padding,
             max_length=max_length,
-            truncation=truncation,
+            truncation=TruncationStrategy.LONGEST_FIRST if self.lazy_tokenization else truncation,
             return_tensors='pt',
         )['input_ids'][0]
 

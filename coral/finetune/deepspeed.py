@@ -325,7 +325,7 @@ def main() -> None:
 
     trainer = SupervisedFinetuneTrainer(args, ds_config)
     trainer.train()
-    # trainer.save()
+    trainer.save(global_steps=trainer.global_step)
 
 
 if __name__ == '__main__':

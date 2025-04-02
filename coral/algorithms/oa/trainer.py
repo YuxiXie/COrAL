@@ -27,6 +27,7 @@ from coral.utils import (
     is_main_process, to_device, 
     decode_masked_text, corrupt_input, replace_with_zero_one,
     corrupt_context,
+    extract_distributions, cal_kl_divergence, cal_pred_probability, cal_kl_divergence_pos,
     json_dump, json_load,
 )
 
@@ -163,6 +164,8 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 replace_indexes=batch['replace_indexes'],
                 use_cache=False,
                 return_logits=True,
+                output_hidden_states=True,
+                output_attentions=True,
             )
             dist.barrier()
             
@@ -179,9 +182,23 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             for pid in range(small_pos, large_pos + 1):
                 loss_dict[pid] += (relative_positions.eq(pid) * batch['position_ids_to_predict'].gt(0) * losses_mask * losses).sum().item()
                 count_dict[pid] += (relative_positions.eq(pid) * batch['position_ids_to_predict'].gt(0) * losses_mask).sum().item()
+
+            attentions = outputs['attentions'][-1].view()
+            
+            
+            import ipdb; ipdb.set_trace()
+            distributions = extract_distributions(self.model, outputs['hidden_states'])
+            # kl_divergences = cal_kl_divergence_pos(distributions[-1], distributions[:-1], batch['position_ids_to_predict'])
+            # kl_divergences = cal_pred_probability(batch['labels'], distributions[:-1])
+            kl_divergences = cal_kl_divergence(distributions[-1], distributions[:-1])
+            L, B, S, W = kl_divergences.size(0), kl_divergences.size(1), kl_divergences.size(2), kl_divergences.size(3)
+            available_flags = batch['position_ids_to_predict'].ne(0).unsqueeze(0).expand(L, B, S, W)
+            available_flags = available_flags.masked_fill(kl_divergences.lt(0), False)
+            kl_divergences, available_flags = kl_divergences.view(L, -1, W), available_flags.view(L, -1, W)
             
             return {i: (torch.tensor(loss_dict[i], device=self.args.device), 
-                        torch.tensor(count_dict[i], device=self.args.device)) for i in loss_dict if i >= (- self.args.context_window * self.args.n_back_pred)}
+                        torch.tensor(count_dict[i], device=self.args.device)) for i in loss_dict if i >= (- self.args.context_window * self.args.n_back_pred)}, \
+                    (kl_divergences * available_flags).sum(1), available_flags.sum(1)
     
     def eval(self) -> dict[str, Any]:
         """Evaluate the model on the evaluation dataset."""
@@ -197,6 +214,10 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         predictions: list[str] = []
         losses: dict[int, list[torch.Tensor]] = defaultdict(list[torch.Tensor])
         counts: dict[int, list[torch.Tensor]] = defaultdict(list[torch.Tensor])
+        # window_size = (self.backward_context_window + 1) if self.args.context_corrupt else (self.forward_context_window + self.backward_context_window + 1)
+        window_size = self.forward_context_window + self.backward_context_window + 1
+        divergences: torch.FloatTensor = torch.zeros((self.model.model.config.num_hidden_layers, window_size), device=self.args.device)
+        divergences_cnt: torch.FloatTensor = torch.zeros((self.model.model.config.num_hidden_layers, window_size), device=self.args.device)
 
         eval_dataloader = tqdm(
             self.eval_dataloader,
@@ -236,10 +257,12 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                     json_dump({'prompts': texts, 'outputs': predictions, 'tracks': tracks, 'flops': self.flops, 'duration': self.durations}, 
                               f'{output_dir}/{self.args.result_fname}.json')
             else:
-                loss = self.eval_step(**batch)
+                loss, div_sum, div_cnt_sum = self.eval_step(**batch)
                 for pid, values in loss.items():
                     losses[pid].append(values[0])
                     counts[pid].append(values[1])
+                divergences = divergences + div_sum
+                divergences_cnt = divergences_cnt + div_cnt_sum
 
         if self.args.do_decoding:
             json_dump({'prompts': texts, 'outputs': predictions, 'tracks': tracks, 'flops': self.flops, 'duration': self.durations}, 
@@ -269,6 +292,8 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             
             # if is_main_process():
             losses = dict(sorted(losses.items(), key=lambda x: x[0]))
+            divergences = divergences / divergences_cnt
+            import ipdb; ipdb.set_trace()
             json_dump(losses, f'{output_dir}/losses_{self.args.result_fname}_rpl{self.args.eval_replace_ratio}.json')
         
         dist.barrier()
@@ -291,6 +316,8 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         return_logits: bool = False,
         use_cache: bool = False,
         freeze_backbone: bool = False,
+        output_hidden_states: bool = False,
+        output_attentions: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Loss function for supervised finetuning."""
         outputs: OAModelOutput = self.model(
@@ -304,11 +331,15 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             replace_indexes=replace_indexes,
             use_cache=use_cache,
             freeze_backbone=freeze_backbone,
+            output_hidden_states=output_hidden_states,
+            output_attentions=output_attentions,
         )
         if return_logits:
             return {
                 'loss': outputs.loss,
                 'logits': outputs.logits.detach(),
+                'hidden_states': outputs.prev_hidden_states if output_hidden_states else None,
+                'attentions': outputs.attentions if output_attentions else None,
             }
         return {
             'loss': outputs.loss,
@@ -319,11 +350,12 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         self,
         input_ids: torch.LongTensor,
         attention_mask: torch.BoolTensor,
-        replace_position_ids: list[torch.LongTensor],
+        new_labels: torch.LongTensor,
         topk: int = 16,
         pred_gap: int = 0,
     ) -> torch.FloatTensor:
         batch_size, seq_length = input_ids.size(0), input_ids.size(-1)
+        raw_input_ids = input_ids.clone()
         
         pred_gap = min(pred_gap, self.forward_context_window - 1)
         position_ids_to_predict = torch.arange(self.forward_context_window - pred_gap, dtype=torch.long, device=self.args.device)
@@ -350,26 +382,20 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
                 tmp_cnt[i, position_ids_to_predict[i, j, cur_positions]] = tmp_cnt[i, position_ids_to_predict[i, j, cur_positions]] + 1
         tmp_cnt = (tmp_cnt.eq(0).float() + tmp_cnt).unsqueeze(-1)
         
-        logits_to_predict, i = [], -1
-        for _replace_position_ids in pad_tensors(replace_position_ids, pad_value=0):
-            i += 1
-            logits_to_predict.append(tmp_logits[i, _replace_position_ids] / tmp_cnt[i, _replace_position_ids])
-        logits = torch.stack(logits_to_predict, dim=0)
-        
-        if self.args.sample_to_replace:
-            probs = self.replace_sampler(input_ids, logits.view(-1, logits.size(-1)))
-            probs = F.softmax(probs, dim=-1)
-            token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1).view(logits.size(0), -1)
-            return None, token_ids
-        
-        topk = topk if topk > 0 else self.tokenizer.vocab_size
-        results = torch.topk(F.softmax(logits, dim=-1), k=topk, dim=-1)
-        return results.values, results.indices
+        probs = self.replace_sampler(input_ids, tmp_logits.view(-1, logits.size(-1)))
+        probs = F.softmax(probs, dim=-1)
+        token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1).view(batch_size, -1)
+        for bid in range(batch_size):
+            indexes = new_labels[bid].ne(IGNORE_INDEX).nonzero().squeeze(-1)
+            input_ids[bid, indexes] = token_ids[bid, indexes]
+        return input_ids
     
     def context_corruption(
         self,
         input_ids: torch.LongTensor,
+        attention_mask: torch.BoolTensor,
         labels: torch.LongTensor,
+        fixed_replace_threshold: float = -1,
     ):
         batch_size = input_ids.size(0)
         
@@ -387,23 +413,31 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
             context_size = min(self.args.max_corrupt_context_size, max(2, label_position_ids.size(-1) // self.args.corrupt_context_num))
             if self.args.multi_context_granularity:
                 context_size = random.choice([i + 1 for i in range(context_size)])
+                # context_size = random.choice([i for i in range(context_size, self.backward_context_window + 1) if i <= max(2, label_position_ids.size(-1) // self.args.corrupt_context_num)])
             num_contexts = (label_position_ids.size(-1) + context_size - 1) // context_size
             ##=== initialize input ids with position info ===##
             cur_input_ids = input_ids[i].clone()[:label_start_idx]
             cur_labels = labels[i].clone()[:label_start_idx]
             ##=== construct shuffled contexts ===##
             cur_input_ids, cur_labels, cur_inject_cnt, context_inject_ratio = corrupt_context(
-                cur_input_ids=cur_input_ids, cur_labels=cur_labels, 
+                cur_input_ids=cur_input_ids, cur_labels=cur_labels,
                 raw_input_ids=input_ids[i], raw_labels=labels[i], raw_label_positions=label_position_ids,
-                context_size=context_size, num_contexts=num_contexts, 
+                context_size=context_size, num_contexts=num_contexts,
                 context_inject_ratio_generator=self.replace_ratio_generator,
+                sample_from_future=self.args.sample_from_future,
+                sample_from_near=self.args.sample_from_near,
+                fixed_replace_threshold=fixed_replace_threshold,
+                tokenizer=self.tokenizer,
             )
             new_input_ids.append(cur_input_ids)
             new_labels.append(cur_labels)
             replace_threshold_list.append(torch.tensor(context_inject_ratio, device=self.args.device).float())
             replace_ratio_list.append(torch.tensor(cur_inject_cnt / max(1, num_contexts - 1), device=self.args.device).float())
             ##=== craft input-output target ===##
-            cur_position_ids_to_predict = torch.arange(self.backward_context_window + 1, dtype=torch.long, device=self.args.device)
+            if fixed_replace_threshold >= 0:
+                cur_position_ids_to_predict = torch.arange(self.forward_context_window + self.backward_context_window + 1, dtype=torch.long, device=self.args.device)
+            else:
+                cur_position_ids_to_predict = torch.arange(self.backward_context_window + 1, dtype=torch.long, device=self.args.device)
             cur_position_ids_to_predict = (cur_position_ids_to_predict - self.backward_context_window) + torch.arange(cur_input_ids.size(-1), dtype=torch.long, device=self.args.device).view(-1, 1)
             cur_position_ids_to_predict = cur_position_ids_to_predict.masked_fill(cur_position_ids_to_predict.lt(label_start_idx), 0)
             cur_position_ids_to_predict = cur_position_ids_to_predict.masked_fill(cur_position_ids_to_predict.ge(cur_labels.size(-1)), 0)
@@ -417,7 +451,19 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         
         replace_threshold = torch.stack(replace_threshold_list, dim=0).mean()
         replace_ratio = torch.stack(replace_ratio_list, dim=0).mean()
+        replace_threshold = get_all_reduce_mean(replace_threshold)
+        replace_ratio = get_all_reduce_mean(replace_ratio)
+        dist.barrier()
         
+        if replace_ratio - .05 < replace_threshold:
+            new_input_ids = self.collect_noisy_inputs(
+                input_ids,
+                attention_mask,
+                new_labels=new_labels,
+                pred_gap=self.args.pred_gap,
+            )
+        if self.args.verbal_training:
+            print(self.tokenizer.decode(new_input_ids[0], skip_special_tokens=True))
         return {
             'input_ids': new_input_ids,     # (B, L)
             'labels': labels_to_predict,        # (B, L, Wf + Wb + 1)
@@ -446,7 +492,9 @@ class OASupervisedFinetuneTrainer(SupervisedTrainer):
         if force_replace and self.args.context_corrupt:
             return self.context_corruption(
                 input_ids=input_ids,
+                attention_mask=attention_mask,
                 labels=labels,
+                fixed_replace_threshold=fixed_replace_threshold,
             )
         
         batch_size, seq_length = input_ids.size(0), input_ids.size(-1)

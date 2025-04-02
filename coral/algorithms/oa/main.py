@@ -1,3 +1,6 @@
+import sys
+sys.path.append('/local/home/yuxi_xie/Projects/COrAsL')
+
 import argparse
 
 import deepspeed
@@ -82,6 +85,21 @@ def parse_arguments() -> argparse.Namespace:
 
     # Training
     training_parser = parser.add_argument_group('training')
+    training_parser.add_argument(
+        '--verbal_training',
+        default=False,
+        action='store_true',
+    )
+    training_parser.add_argument(
+        '--sample_from_near',
+        default=False,
+        action='store_true',
+    )
+    training_parser.add_argument(
+        '--sample_from_future',
+        default=False,
+        action='store_true',
+    )
     training_parser.add_argument(
         '--max_corrupt_context_size',
         default=4,
