@@ -1,6 +1,10 @@
 # Context-Wise Order-Agnostic Language Modeling
 
-This repository contains code and analysis for the paper: [COrAL: Order-Agnostic Language Modeling for Efficient Iterative Refinement](). Below is the framework of our proposed method.
+This repository contains code and analysis for the paper: [COrAL: Order-Agnostic Language Modeling for Efficient Iterative Refinement](https://arxiv.org/abs/2410.09675). 
+
+![Demo](ezgif.com-video-to-gif-converter.gif)
+
+Below is the framework of our proposed method.
 
 * Training Objective implementation: [`coral/algorithms/oa`](./coral/algorithms/oa)
 
